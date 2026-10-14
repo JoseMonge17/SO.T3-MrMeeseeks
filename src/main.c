@@ -29,6 +29,33 @@
 
 #define MAX_TEXTO 256
 
+typedef enum {
+    TIPO_TEXTO = 1,
+    TIPO_CALCULO = 2,
+    TIPO_PROGRAMA = 3
+} TipoSolicitud;
+
+typedef struct 
+{
+    TipoSolicitud tipo;
+    char contenido[MAX_TEXTO];
+} Solicitud;
+
+static const char *nombre_tipo(TipoSolicitud tipo)
+{
+    switch (tipo)
+    {
+        case TIPO_TEXTO:
+            return "Texto (simulacion)";
+        case TIPO_CALCULO:
+            return "Calculo aritmetico o logico";
+        case TIPO_PROGRAMA:
+            return "Programa externo";
+        default:
+            return "Desconocido";
+    }
+}
+
 static void limpiar_espacios(char *texto) 
 {
     char *inicio = texto;
@@ -64,6 +91,33 @@ static bool leer_solicitud(char **texto, size_t *capacidad)
     return true;
 }
 
+static int leer_opcion(void)
+{
+    char *entrada = NULL;
+    size_t capacidad = 0;
+
+    printf("Opcion: ");
+    fflush(stdout);
+
+    ssize_t leidos = getline(&entrada, &capacidad, stdin);
+    if (leidos == -1)
+    {
+        free(entrada);
+        return -1;
+    }
+
+    limpiar_espacios(entrada);
+
+    int opcion = -1;
+    if (strlen(entrada) == 1 && entrada[0] >= '0' && entrada[0] <= '3')
+    {
+        opcion = entrada[0] - '0';
+    }
+
+    free(entrada);
+    return opcion;
+}
+
 static int box(void)
 {
     //char solicitud[256];
@@ -73,32 +127,45 @@ static int box(void)
     char *solicitud = NULL;
     size_t capacidad = 0;
     unsigned int total_solicitudes = 0;
-    int resultado = EXIT_SUCCESS;
-
-    printf("Escriba una solicitud o 'Salir' para terminar \n");
 
     while(1)
     {
+        puts("\n--- MENU PRINCIPAL ---");
+        puts("1. Solicitud textual (simulacion)");
+        puts("2. Calculo aritmetico o logico");
+        puts("3. Ejecucion de programa externo");
+        puts("0. Salir");
+
+        int opcion = leer_opcion(); 
+
+        if (opcion == -1)
+        {
+            puts("Opcion invalida. Seleccione un numero entre 0 y 3.");
+            continue;
+        } 
+        else if (opcion == 0)
+            break;
+
+        TipoSolicitud tipo = (TipoSolicitud)opcion;
+
         bool estado = leer_solicitud(&solicitud, &capacidad);
+        
         if (estado == false) 
         {
             puts("Error al ingresar la solicitud");
-            break;
-        } 
-        else if (strcasecmp(solicitud, "Salir") == 0) 
-        {
-            break;
+            continue;
         }
 
         total_solicitudes++;
         printf("Box: solicitud #%u recibida: \"%s\"\n", total_solicitudes, solicitud);
+        printf("Box: tipo de solicitud: %s\n", nombre_tipo(tipo));
         puts("Box: pendiente de procesar.");
     }
 
     printf("\nTotal de solicitudes recibidas: %u\n", total_solicitudes);
     puts("Box: ¡Hasta luego!");
     free(solicitud);
-    return resultado;
+    return 0;
 
 }
 

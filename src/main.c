@@ -18,6 +18,7 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -47,6 +48,23 @@ typedef struct
     bool tiempo_aleatorio;
     double tiempo_segundos;
 } Solicitud;
+
+typedef enum
+{
+    RESULTADO_PENDIENTE,
+    RESULTADO_COMPLETADO,
+    RESULTADO_NO_COMPLETADO
+} EstadoResultado;
+
+/* Respuesta privada del Meeseeks; no contiene punteros a memoria del hijo. */
+typedef struct
+{
+    EstadoResultado estado;
+    pid_t pid;
+    pid_t ppid;
+    unsigned int nivel;
+    unsigned int instancia;
+} Resultado;
 
 static const char *nombre_tipo(TipoSolicitud tipo)
 {
@@ -194,8 +212,8 @@ static bool capturar_datos_textuales(Solicitud *solicitud)
     }
 
     puts("\nDuracion de la simulacion:");
-    puts("1. Aleatoria (entre 0.5 y 5 segundos)");
-    puts("2. Definida por el usuario");
+    puts("1. Definida por el usuario");
+    puts("2. Aleatoria (entre 0.5 y 5 segundos)");
     puts("0. Cancelar solicitud");
 
     while (1)
@@ -206,14 +224,6 @@ static bool capturar_datos_textuales(Solicitud *solicitud)
             return false;
 
         if (opcion == 1)
-        {
-            /* Cada Meeseeks generara su propia duracion al ejecutarse. */
-            solicitud->tiempo_aleatorio = true;
-            solicitud->tiempo_segundos = 0.0;
-            return true;
-        }
-
-        if (opcion == 2)
         {
             double segundos;
 
@@ -230,6 +240,14 @@ static bool capturar_datos_textuales(Solicitud *solicitud)
 
             solicitud->tiempo_aleatorio = false;
             solicitud->tiempo_segundos = segundos;
+            return true;
+        }
+
+        if (opcion == 2)
+        {
+            /* Cada Meeseeks generara su propia duracion al ejecutarse. */
+            solicitud->tiempo_aleatorio = true;
+            solicitud->tiempo_segundos = 0.0;
             return true;
         }
 
@@ -264,40 +282,111 @@ static void mostrar_solicitud(const Solicitud *solicitud, unsigned int numero)
     puts("Box: pendiente de procesar.");
 }
 
-/* Por ahora el hijo solo se presenta y se despide, sin resolver la solicitud. */
-static void meeseeks(unsigned int nivel, unsigned int instancia)
+static bool escribir_completo(int descriptor, const void *datos, size_t cantidad)
 {
-    printf("Hi, I'm Mr. Meeseeks! Look at Meeeee. (%ld, %ld, %u, %u)\n",
-           (long)getpid(), (long)getppid(), nivel, instancia);
-    printf("Meeseeks (PID %ld, PPID %ld): Hasta luego. La solicitud sigue pendiente.\n",
-           (long)getpid(), (long)getppid());
+    const char *bytes = datos;
+    size_t enviados = 0;
+
+    while (enviados < cantidad)
+    {
+        ssize_t escritos = write(descriptor, bytes + enviados, cantidad - enviados);
+
+        if (escritos == -1)
+        {
+            if (errno == EINTR)
+                continue;
+            return false;
+        }
+
+        if (escritos == 0)
+        {
+            errno = EIO;
+            return false;
+        }
+
+        enviados += (size_t)escritos;
+    }
+
+    return true;
 }
 
-/* La Box crea un hijo y lo recoge antes de recibir otra solicitud. */
-static bool crear_meeseeks(void)
+static bool leer_completo(int descriptor, void *datos, size_t cantidad)
 {
-    /* Evita que el hijo vuelva a imprimir la salida pendiente de la Box. */
-    if (fflush(stdout) == EOF)
+    char *bytes = datos;
+    size_t recibidos = 0;
+
+    while (recibidos < cantidad)
     {
-        perror("Error al mostrar la salida de la Box");
-        return false;
+        ssize_t leidos = read(descriptor, bytes + recibidos, cantidad - recibidos);
+
+        if (leidos == -1)
+        {
+            if (errno == EINTR)
+                continue;
+            return false;
+        }
+
+        if (leidos == 0)
+        {
+            /* El emisor cerro el pipe antes de completar el mensaje. */
+            errno = EPIPE;
+            return false;
+        }
+
+        recibidos += (size_t)leidos;
     }
 
-    pid_t pid = fork();
+    return true;
+}
 
-    if (pid == -1)
+/* Lee su mensaje privado y confirma la recepcion; aun no resuelve la tarea. */
+static int meeseeks(int entrada, int salida, unsigned int nivel, unsigned int instancia)
+{
+    Resultado resultado = {0};
+    resultado.estado = RESULTADO_PENDIENTE;
+    resultado.pid = getpid();
+    resultado.ppid = getppid();
+    resultado.nivel = nivel;
+    resultado.instancia = instancia;
+
+    printf("Hi, I'm Mr. Meeseeks! Look at Meeeee. (%ld, %ld, %u, %u)\n",
+           (long)resultado.pid, (long)resultado.ppid, nivel, instancia);
+
+    Solicitud solicitud = {0};
+    bool recibida = leer_completo(entrada, &solicitud, sizeof(solicitud));
+    int error_lectura = errno;
+    close(entrada);
+
+    if (!recibida)
     {
-        perror("Error al crear el Meeseeks");
-        return false;
+        fprintf(stderr, "Meeseeks (PID %ld, PPID %ld): error al recibir solicitud: %s.\n",
+                (long)resultado.pid, (long)resultado.ppid, strerror(error_lectura));
+        close(salida);
+        return EXIT_FAILURE;
     }
 
-    if (pid == 0)
+    printf("Meeseeks (PID %ld, PPID %ld): recibi por pipe la solicitud \"%s\" (%s).\n",
+           (long)resultado.pid, (long)resultado.ppid,
+           solicitud.contenido, nombre_tipo(solicitud.tipo));
+
+    bool enviado = escribir_completo(salida, &resultado, sizeof(resultado));
+    int error_escritura = errno;
+    close(salida);
+
+    if (!enviado)
     {
-        meeseeks(1, 1);
-        /* El hijo termina aqui: no debe continuar con el menu de la Box. */
-        _exit(fflush(stdout) == EOF ? EXIT_FAILURE : EXIT_SUCCESS);
+        fprintf(stderr, "Meeseeks (PID %ld, PPID %ld): error al enviar resultado: %s.\n",
+                (long)resultado.pid, (long)resultado.ppid, strerror(error_escritura));
+        return EXIT_FAILURE;
     }
 
+    printf("Meeseeks (PID %ld, PPID %ld): Hasta luego. La solicitud sigue pendiente.\n",
+           (long)resultado.pid, (long)resultado.ppid);
+    return EXIT_SUCCESS;
+}
+
+static bool esperar_meeseeks(pid_t pid)
+{
     int estado;
     pid_t esperado;
 
@@ -328,6 +417,99 @@ static bool crear_meeseeks(void)
     return true;
 }
 
+/* Cada hijo recibe sus propios canales Box -> hijo e hijo -> Box. */
+static bool crear_meeseeks(const Solicitud *solicitud, Resultado *resultado)
+{
+    /* Evita que el hijo vuelva a imprimir la salida pendiente de la Box. */
+    if (fflush(stdout) == EOF)
+    {
+        perror("Error al mostrar la salida de la Box");
+        return false;
+    }
+
+    int peticion[2];
+    int respuesta[2];
+
+    if (pipe(peticion) == -1)
+    {
+        perror("Error al crear el pipe de solicitud");
+        return false;
+    }
+
+    if (pipe(respuesta) == -1)
+    {
+        perror("Error al crear el pipe de resultado");
+        close(peticion[0]);
+        close(peticion[1]);
+        return false;
+    }
+
+    pid_t pid = fork();
+
+    if (pid == -1)
+    {
+        perror("Error al crear el Meeseeks");
+        close(peticion[0]);
+        close(peticion[1]);
+        close(respuesta[0]);
+        close(respuesta[1]);
+        return false;
+    }
+
+    if (pid == 0)
+    {
+        close(peticion[1]);
+        close(respuesta[0]);
+        int estado = meeseeks(peticion[0], respuesta[1], 1, 1);
+
+        /* El hijo termina aqui: no debe continuar con el menu de la Box. */
+        if (fflush(stdout) == EOF)
+            estado = EXIT_FAILURE;
+        _exit(estado);
+    }
+
+    close(peticion[0]);
+    close(respuesta[1]);
+
+    bool comunicado = escribir_completo(peticion[1], solicitud, sizeof(*solicitud));
+    if (!comunicado)
+        perror("Error al enviar la solicitud");
+    close(peticion[1]);
+
+    /* Recibe antes de waitpid: el hijo puede estar esperando espacio en el pipe. */
+    if (comunicado)
+    {
+        comunicado = leer_completo(respuesta[0], resultado, sizeof(*resultado));
+        if (!comunicado)
+            perror("Error al recibir el resultado");
+    }
+    close(respuesta[0]);
+
+    /* Recoge al hijo incluso cuando falla la comunicacion. */
+    bool terminado = esperar_meeseeks(pid);
+    return comunicado && terminado;
+}
+
+static void mostrar_resultado(const Resultado *resultado)
+{
+    printf("Box: resultado recibido por pipe de Meeseeks (PID %ld, PPID %ld, N %u, i %u).\n",
+           (long)resultado->pid, (long)resultado->ppid,
+           resultado->nivel, resultado->instancia);
+
+    switch (resultado->estado)
+    {
+        case RESULTADO_PENDIENTE:
+            puts("Box: solicitud recibida por el Meeseeks; pendiente de procesar.");
+            break;
+        case RESULTADO_COMPLETADO:
+            puts("Box: solicitud completada.");
+            break;
+        case RESULTADO_NO_COMPLETADO:
+            puts("Box: solicitud no completada.");
+            break;
+    }
+}
+
 static int box(void)
 {
     //char solicitud[256];
@@ -342,6 +524,16 @@ static int box(void)
     size_t capacidad = 0;
     unsigned int total_solicitudes = 0;
     int resultado = EXIT_SUCCESS;
+
+    /* Un pipe sin lector debe producir EPIPE, sin terminar abruptamente la Box. */
+    struct sigaction accion = {0};
+    accion.sa_handler = SIG_IGN;
+    sigemptyset(&accion.sa_mask);
+    if (sigaction(SIGPIPE, &accion, NULL) == -1)
+    {
+        perror("Error al configurar SIGPIPE");
+        return EXIT_FAILURE;
+    }
 
     /* La semilla se configura una sola vez durante la ejecucion de Box. */
     srand((unsigned int)time(NULL));
@@ -414,11 +606,14 @@ static int box(void)
         total_solicitudes++;
         mostrar_solicitud(&solicitud, total_solicitudes);
 
-        if (!crear_meeseeks())
+        Resultado respuesta = {0};
+        if (!crear_meeseeks(&solicitud, &respuesta))
         {
             resultado = EXIT_FAILURE;
             break;
         }
+
+        mostrar_resultado(&respuesta);
     }
 
     printf("\nTotal de solicitudes recibidas: %u\n", total_solicitudes);

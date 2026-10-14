@@ -264,6 +264,70 @@ static void mostrar_solicitud(const Solicitud *solicitud, unsigned int numero)
     puts("Box: pendiente de procesar.");
 }
 
+/* Por ahora el hijo solo se presenta y se despide, sin resolver la solicitud. */
+static void meeseeks(unsigned int nivel, unsigned int instancia)
+{
+    printf("Hi, I'm Mr. Meeseeks! Look at Meeeee. (%ld, %ld, %u, %u)\n",
+           (long)getpid(), (long)getppid(), nivel, instancia);
+    printf("Meeseeks (PID %ld, PPID %ld): Hasta luego. La solicitud sigue pendiente.\n",
+           (long)getpid(), (long)getppid());
+}
+
+/* La Box crea un hijo y lo recoge antes de recibir otra solicitud. */
+static bool crear_meeseeks(void)
+{
+    /* Evita que el hijo vuelva a imprimir la salida pendiente de la Box. */
+    if (fflush(stdout) == EOF)
+    {
+        perror("Error al mostrar la salida de la Box");
+        return false;
+    }
+
+    pid_t pid = fork();
+
+    if (pid == -1)
+    {
+        perror("Error al crear el Meeseeks");
+        return false;
+    }
+
+    if (pid == 0)
+    {
+        meeseeks(1, 1);
+        /* El hijo termina aqui: no debe continuar con el menu de la Box. */
+        _exit(fflush(stdout) == EOF ? EXIT_FAILURE : EXIT_SUCCESS);
+    }
+
+    int estado;
+    pid_t esperado;
+
+    do
+    {
+        esperado = waitpid(pid, &estado, 0);
+    } while (esperado == -1 && errno == EINTR);
+
+    if (esperado == -1)
+    {
+        perror("Error al esperar al Meeseeks");
+        return false;
+    }
+
+    if (WIFSIGNALED(estado))
+    {
+        fprintf(stderr, "Box: Meeseeks PID %ld termino por la senal %d.\n",
+                (long)pid, WTERMSIG(estado));
+        return false;
+    }
+
+    if (!WIFEXITED(estado) || WEXITSTATUS(estado) != EXIT_SUCCESS)
+    {
+        fprintf(stderr, "Box: Meeseeks PID %ld termino con error.\n", (long)pid);
+        return false;
+    }
+
+    return true;
+}
+
 static int box(void)
 {
     //char solicitud[256];
@@ -349,6 +413,12 @@ static int box(void)
 
         total_solicitudes++;
         mostrar_solicitud(&solicitud, total_solicitudes);
+
+        if (!crear_meeseeks())
+        {
+            resultado = EXIT_FAILURE;
+            break;
+        }
     }
 
     printf("\nTotal de solicitudes recibidas: %u\n", total_solicitudes);

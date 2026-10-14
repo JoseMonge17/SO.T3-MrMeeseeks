@@ -17,6 +17,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -97,33 +98,6 @@ static bool leer_solicitud(char **texto, size_t *capacidad)
     return true;
 }
 
-static int leer_opcion(void)
-{
-    char *entrada = NULL;
-    size_t capacidad = 0;
-
-    printf("Opcion: ");
-    fflush(stdout);
-
-    ssize_t leidos = getline(&entrada, &capacidad, stdin);
-    if (leidos == -1)
-    {
-        free(entrada);
-        return -1;
-    }
-
-    limpiar_espacios(entrada);
-
-    int opcion = -1;
-    if (strlen(entrada) == 1 && entrada[0] >= '0' && entrada[0] <= '3')
-    {
-        opcion = entrada[0] - '0';
-    }
-
-    free(entrada);
-    return opcion;
-}
-
 static bool leer_numero(const char *mensaje, double *numero)
 {
     char *entrada = NULL;
@@ -156,6 +130,21 @@ static bool leer_numero(const char *mensaje, double *numero)
         free(entrada);
         return true;
     }
+}
+
+/* El menu valida las opciones permitidas; aqui solo se exige un entero. */
+static int leer_opcion(void)
+{
+    double numero;
+
+    if (!leer_numero("Opcion: ", &numero))
+        return -2;
+
+    /* Evita truncar decimales o convertir valores fuera del rango de int. */
+    if (numero < 0.0 || numero > INT_MAX || numero != (int)numero)
+        return -1;
+
+    return (int)numero;
 }
 
 static bool capturar_datos_textuales(Solicitud *solicitud)
@@ -303,7 +292,17 @@ static int box(void)
 
         int opcion = leer_opcion(); 
 
-        if (opcion == -1)
+        if (opcion == -2)
+        {
+            if (ferror(stdin))
+            {
+                perror("Error al leer la opcion");
+                resultado = EXIT_FAILURE;
+            }
+            break;
+        }
+
+        if (opcion < 0 || opcion > 3)
         {
             puts("Opcion invalida. Seleccione un numero entre 0 y 3.");
             continue;

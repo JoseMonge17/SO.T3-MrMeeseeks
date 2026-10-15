@@ -17,6 +17,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <errno.h>
+#include <fenv.h>
 #include <limits.h>
 #include <signal.h>
 #include <stdio.h>
@@ -30,6 +31,8 @@
 #include <stdbool.h>
 #include <math.h>
 #include <time.h>
+
+#include "../vendor/tinyexpr/tinyexpr.h"
 
 #define MAX_TEXTO 256
 
@@ -64,6 +67,7 @@ typedef struct
     pid_t ppid;
     unsigned int nivel;
     unsigned int instancia;
+    char detalle[MAX_TEXTO];
 } Resultado;
 
 static const char *nombre_tipo(TipoSolicitud tipo)
@@ -339,7 +343,80 @@ static bool leer_completo(int descriptor, void *datos, size_t cantidad)
     return true;
 }
 
-/* Lee su mensaje privado y confirma la recepcion; aun no resuelve la tarea. */
+static void procesar_calculo(const char *expresion, Resultado *resultado)
+{
+    resultado->estado = RESULTADO_NO_COMPLETADO;
+
+    const char *actual = expresion;
+    while (*actual != '\0')
+    {
+        if (isdigit((unsigned char)*actual) || *actual == '.')
+        {
+            char *fin;
+            (void)strtod(actual, &fin);
+            if (fin != actual)
+            {
+                actual = fin;
+                continue;
+            }
+        }
+
+        if (isalpha((unsigned char)*actual) || *actual == '_')
+        {
+            snprintf(resultado->detalle, sizeof(resultado->detalle),
+                     "Esta etapa admite numeros y operadores, sin funciones ni variables.");
+            return;
+        }
+
+        actual++;
+    }
+
+    /* TinyExpr tambien evalua operaciones mientras compila la expresion. */
+    if (feclearexcept(FE_ALL_EXCEPT) != 0)
+    {
+        snprintf(resultado->detalle, sizeof(resultado->detalle),
+                 "No se pudo preparar la deteccion de errores numericos.");
+        return;
+    }
+
+    int error = 0;
+    errno = 0;
+    double valor = te_interp(expresion, &error);
+    int error_numerico = errno;
+    int excepciones = fetestexcept(FE_DIVBYZERO | FE_INVALID | FE_OVERFLOW);
+
+    if (error < 0)
+    {
+        snprintf(resultado->detalle, sizeof(resultado->detalle),
+                 "Memoria insuficiente para interpretar la expresion.");
+    }
+    else if (error > 0)
+    {
+        snprintf(resultado->detalle, sizeof(resultado->detalle),
+                 "Expresion invalida cerca de la posicion %d (contada desde 1).", error);
+    }
+    else if (excepciones & FE_DIVBYZERO)
+    {
+        snprintf(resultado->detalle, sizeof(resultado->detalle), "Division por cero.");
+    }
+    else if ((excepciones & FE_INVALID) || error_numerico == EDOM)
+    {
+        snprintf(resultado->detalle, sizeof(resultado->detalle),
+                 "Operacion indefinida: por ejemplo 0/0, resto entre cero o potencia fuera de dominio.");
+    }
+    else if ((excepciones & FE_OVERFLOW) || error_numerico == ERANGE || !isfinite(valor))
+    {
+        snprintf(resultado->detalle, sizeof(resultado->detalle),
+                 "Resultado fuera del rango numerico admitido.");
+    }
+    else
+    {
+        resultado->estado = RESULTADO_COMPLETADO;
+        snprintf(resultado->detalle, sizeof(resultado->detalle), "Resultado: %.15g", valor);
+    }
+}
+
+/* Recibe su solicitud privada y devuelve el resultado a su padre. */
 static int meeseeks(int entrada, int salida, unsigned int nivel, unsigned int instancia)
 {
     Resultado resultado = {0};
@@ -369,6 +446,9 @@ static int meeseeks(int entrada, int salida, unsigned int nivel, unsigned int in
            (long)resultado.pid, (long)resultado.ppid,
            solicitud.contenido, nombre_tipo(solicitud.tipo));
 
+    if (solicitud.tipo == TIPO_CALCULO)
+        procesar_calculo(solicitud.contenido, &resultado);
+
     bool enviado = escribir_completo(salida, &resultado, sizeof(resultado));
     int error_escritura = errno;
     close(salida);
@@ -380,7 +460,7 @@ static int meeseeks(int entrada, int salida, unsigned int nivel, unsigned int in
         return EXIT_FAILURE;
     }
 
-    printf("Meeseeks (PID %ld, PPID %ld): Hasta luego. La solicitud sigue pendiente.\n",
+    printf("Meeseeks (PID %ld, PPID %ld): Hasta luego. Resultado enviado a la Box.\n",
            (long)resultado.pid, (long)resultado.ppid);
     return EXIT_SUCCESS;
 }
@@ -508,6 +588,9 @@ static void mostrar_resultado(const Resultado *resultado)
             puts("Box: solicitud no completada.");
             break;
     }
+
+    if (resultado->detalle[0] != '\0')
+        printf("Box: %s\n", resultado->detalle);
 }
 
 static int box(void)

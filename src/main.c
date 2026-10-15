@@ -18,6 +18,7 @@
 
 #include <errno.h>
 #include <fenv.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
 #include <stdio.h>
@@ -35,6 +36,7 @@
 #include "../vendor/tinyexpr/tinyexpr.h"
 
 #define MAX_TEXTO 256
+#define MAX_ARGUMENTOS 32
 
 typedef enum {
     TIPO_TEXTO = 1,
@@ -67,6 +69,7 @@ typedef struct
     pid_t ppid;
     unsigned int nivel;
     unsigned int instancia;
+    double tiempo_real_segundos;
     char detalle[MAX_TEXTO];
 } Resultado;
 
@@ -416,6 +419,252 @@ static void procesar_calculo(const char *expresion, Resultado *resultado)
     }
 }
 
+static bool esperar_proceso(pid_t pid, int *estado)
+{
+    pid_t esperado;
+
+    do
+    {
+        esperado = waitpid(pid, estado, 0);
+    } while (esperado == -1 && errno == EINTR);
+
+    return esperado != -1;
+}
+
+static bool separar_argumentos(char *comando, char *argumentos[], size_t capacidad,
+                              Resultado *resultado)
+{
+    char *lectura = comando;
+    char *escritura = comando;
+    size_t cantidad = 0;
+
+    while (*lectura != '\0')
+    {
+        while (isspace((unsigned char)*lectura))
+            lectura++;
+        if (*lectura == '\0')
+            break;
+
+        if (cantidad + 1 >= capacidad)
+        {
+            snprintf(resultado->detalle, sizeof(resultado->detalle),
+                     "Maximo %zu argumentos, incluido el programa.", capacidad - 1);
+            return false;
+        }
+
+        argumentos[cantidad++] = escritura;
+        char comilla = '\0';
+
+        while (*lectura != '\0' && (comilla != '\0' || !isspace((unsigned char)*lectura)))
+        {
+            char actual = *lectura++;
+
+            if (actual == '\\' && comilla != '\'')
+            {
+                if (*lectura == '\0')
+                {
+                    snprintf(resultado->detalle, sizeof(resultado->detalle),
+                             "Escape incompleto al final del comando.");
+                    return false;
+                }
+                *escritura++ = *lectura++;
+            }
+            else if (comilla != '\0' && actual == comilla)
+            {
+                comilla = '\0';
+            }
+            else if (comilla == '\0' && (actual == '\'' || actual == '"'))
+            {
+                comilla = actual;
+            }
+            else if (comilla == '\0' && strchr("|&;<>", actual) != NULL)
+            {
+                snprintf(resultado->detalle, sizeof(resultado->detalle),
+                         "No se admiten operadores de shell sin comillas.");
+                return false;
+            }
+            else
+            {
+                *escritura++ = actual;
+            }
+        }
+
+        if (comilla != '\0')
+        {
+            snprintf(resultado->detalle, sizeof(resultado->detalle), "Comillas sin cerrar.");
+            return false;
+        }
+
+        /* Avanza antes de escribir el terminador para no borrar un separador pendiente. */
+        while (isspace((unsigned char)*lectura))
+            lectura++;
+        *escritura++ = '\0';
+    }
+
+    argumentos[cantidad] = NULL;
+    if (cantidad == 0 || argumentos[0][0] == '\0')
+    {
+        snprintf(resultado->detalle, sizeof(resultado->detalle), "Falta el nombre del programa.");
+        return false;
+    }
+
+    return true;
+}
+
+static bool leer_error_ejecucion(int descriptor, int *error_ejecucion)
+{
+    ssize_t leidos;
+
+    do
+    {
+        leidos = read(descriptor, error_ejecucion, sizeof(*error_ejecucion));
+    } while (leidos == -1 && errno == EINTR);
+
+    if (leidos == -1)
+        return false;
+    if (leidos == 0)
+    {
+        *error_ejecucion = 0;
+        return true;
+    }
+
+    return leer_completo(descriptor, (char *)error_ejecucion + leidos,
+                         sizeof(*error_ejecucion) - (size_t)leidos);
+}
+
+static void ejecutar_programa_hijo(char *const argumentos[], int errores, int respuesta)
+{
+    close(respuesta);
+    int error_ejecucion = 0;
+
+    /* El programa no debe consumir las siguientes opciones de la Box. */
+    int entrada = open("/dev/null", O_RDONLY);
+    if (entrada == -1)
+        error_ejecucion = errno;
+    else if (entrada != STDIN_FILENO)
+    {
+        if (dup2(entrada, STDIN_FILENO) == -1)
+            error_ejecucion = errno;
+        close(entrada);
+    }
+
+    struct sigaction accion = {0};
+    accion.sa_handler = SIG_DFL;
+    sigemptyset(&accion.sa_mask);
+    if (error_ejecucion == 0 && sigaction(SIGPIPE, &accion, NULL) == -1)
+        error_ejecucion = errno;
+
+    if (error_ejecucion == 0)
+    {
+        execvp(argumentos[0], argumentos);
+        error_ejecucion = errno;
+    }
+
+    (void)escribir_completo(errores, &error_ejecucion, sizeof(error_ejecucion));
+    close(errores);
+    _exit(127);
+}
+
+static void procesar_programa(const char *contenido, int respuesta, Resultado *resultado)
+{
+    resultado->estado = RESULTADO_NO_COMPLETADO;
+    char comando[MAX_TEXTO];
+    strcpy(comando, contenido);
+    char *argumentos[MAX_ARGUMENTOS + 1];
+
+    if (!separar_argumentos(comando, argumentos, MAX_ARGUMENTOS + 1, resultado))
+        return;
+
+    if (fflush(stdout) == EOF)
+    {
+        snprintf(resultado->detalle, sizeof(resultado->detalle),
+                 "Error al mostrar la salida antes de ejecutar: %s.", strerror(errno));
+        return;
+    }
+
+    int errores[2];
+    if (pipe(errores) == -1)
+    {
+        snprintf(resultado->detalle, sizeof(resultado->detalle),
+                 "Error al crear el pipe de ejecucion: %s.", strerror(errno));
+        return;
+    }
+
+    /* Un exec correcto cierra el escritor: EOF indica que no fallo el lanzamiento. */
+    struct timespec inicio;
+    if (fcntl(errores[1], F_SETFD, FD_CLOEXEC) == -1 ||
+        clock_gettime(CLOCK_MONOTONIC, &inicio) == -1)
+    {
+        snprintf(resultado->detalle, sizeof(resultado->detalle),
+                 "Error al preparar la ejecucion: %s.", strerror(errno));
+        close(errores[0]);
+        close(errores[1]);
+        return;
+    }
+
+    pid_t pid = fork();
+    if (pid == -1)
+    {
+        snprintf(resultado->detalle, sizeof(resultado->detalle),
+                 "Error al crear el proceso del programa: %s.", strerror(errno));
+        close(errores[0]);
+        close(errores[1]);
+        return;
+    }
+
+    if (pid == 0)
+    {
+        close(errores[0]);
+        ejecutar_programa_hijo(argumentos, errores[1], respuesta);
+    }
+
+    close(errores[1]);
+    int error_ejecucion = 0;
+    bool comunicado = leer_error_ejecucion(errores[0], &error_ejecucion);
+    int error_comunicacion = errno;
+    close(errores[0]);
+
+    int estado;
+    if (!esperar_proceso(pid, &estado))
+    {
+        snprintf(resultado->detalle, sizeof(resultado->detalle),
+                 "Error al esperar el programa: %s.", strerror(errno));
+        return;
+    }
+
+    struct timespec fin;
+    if (clock_gettime(CLOCK_MONOTONIC, &fin) == -1)
+    {
+        snprintf(resultado->detalle, sizeof(resultado->detalle),
+                 "Error al medir el tiempo del programa: %s.", strerror(errno));
+        return;
+    }
+
+    resultado->tiempo_real_segundos = (double)(fin.tv_sec - inicio.tv_sec) +
+                                     (double)(fin.tv_nsec - inicio.tv_nsec) / 1000000000.0;
+
+    if (!comunicado)
+        snprintf(resultado->detalle, sizeof(resultado->detalle),
+                 "Error al recibir el estado de ejecucion: %s.", strerror(error_comunicacion));
+    else if (error_ejecucion != 0)
+        snprintf(resultado->detalle, sizeof(resultado->detalle),
+                 "No se pudo lanzar el programa (errno %d): %s.",
+                 error_ejecucion, strerror(error_ejecucion));
+    else if (WIFSIGNALED(estado))
+        snprintf(resultado->detalle, sizeof(resultado->detalle),
+                 "El programa termino por la senal %d.", WTERMSIG(estado));
+    else if (WIFEXITED(estado))
+    {
+        int codigo = WEXITSTATUS(estado);
+        resultado->estado = codigo == 0 ? RESULTADO_COMPLETADO : RESULTADO_NO_COMPLETADO;
+        snprintf(resultado->detalle, sizeof(resultado->detalle),
+                 "El programa termino con codigo de salida %d.", codigo);
+    }
+    else
+        snprintf(resultado->detalle, sizeof(resultado->detalle),
+                 "El programa termino con un estado inesperado.");
+}
+
 /* Recibe su solicitud privada y devuelve el resultado a su padre. */
 static int meeseeks(int entrada, int salida, unsigned int nivel, unsigned int instancia)
 {
@@ -425,6 +674,7 @@ static int meeseeks(int entrada, int salida, unsigned int nivel, unsigned int in
     resultado.ppid = getppid();
     resultado.nivel = nivel;
     resultado.instancia = instancia;
+    resultado.tiempo_real_segundos = -1.0;
 
     printf("Hi, I'm Mr. Meeseeks! Look at Meeeee. (%ld, %ld, %u, %u)\n",
            (long)resultado.pid, (long)resultado.ppid, nivel, instancia);
@@ -448,6 +698,8 @@ static int meeseeks(int entrada, int salida, unsigned int nivel, unsigned int in
 
     if (solicitud.tipo == TIPO_CALCULO)
         procesar_calculo(solicitud.contenido, &resultado);
+    else if (solicitud.tipo == TIPO_PROGRAMA)
+        procesar_programa(solicitud.contenido, salida, &resultado);
 
     bool enviado = escribir_completo(salida, &resultado, sizeof(resultado));
     int error_escritura = errno;
@@ -468,14 +720,8 @@ static int meeseeks(int entrada, int salida, unsigned int nivel, unsigned int in
 static bool esperar_meeseeks(pid_t pid)
 {
     int estado;
-    pid_t esperado;
 
-    do
-    {
-        esperado = waitpid(pid, &estado, 0);
-    } while (esperado == -1 && errno == EINTR);
-
-    if (esperado == -1)
+    if (!esperar_proceso(pid, &estado))
     {
         perror("Error al esperar al Meeseeks");
         return false;
@@ -591,6 +837,9 @@ static void mostrar_resultado(const Resultado *resultado)
 
     if (resultado->detalle[0] != '\0')
         printf("Box: %s\n", resultado->detalle);
+
+    if (resultado->tiempo_real_segundos >= 0.0)
+        printf("Box: tiempo real del programa: %.6f segundos.\n", resultado->tiempo_real_segundos);
 }
 
 static int box(void)

@@ -51,23 +51,27 @@ evitar problemas con espacios al pegarlo.
 3. Incorporé pipes privados para enviar solicitudes y recibir resultados completos.
 4. Integré TinyExpr para evaluar cálculos y comunicar sus errores.
 5. Agregué ejecución de programas, argumentos, estados de salida y tiempo real.
+6. Separé los tiempos por solicitud y agregué un historial con el informe al salir.
 
 ## Organización del código
 
 `TipoSolicitud` identifica el caso. `Solicitud` guarda contenido y configuración.
-`Resultado` guarda estado, identidad, detalle y tiempo; `-1` indica que no hay
-una medición disponible.
+`Resultado` guarda estado, identidad, cantidad de Meeseeks, detalle, tiempo del
+programa y pausa simulada. `RegistroSolicitud` conserva esos datos junto con la
+solicitud y su tiempo total. Un tiempo medido en `-1` indica que no está disponible.
 
 | Parte | Funciones |
 | --- | --- |
 | Control | `main()` llama a `box()`, que administra el menú, las cancelaciones y el total recibido. |
 | Lectura | `limpiar_espacios()`, `leer_solicitud()`, `leer_numero()` y `leer_opcion()` validan entradas. EOF o un error de lectura permiten terminar. |
 | Configuración | `capturar_datos_textuales()` pide facilidad y duración: 1 manual, 2 aleatorio. |
-| Presentación | `nombre_tipo()`, `mostrar_solicitud()` y `mostrar_resultado()` muestran la información. |
+| Presentación | `nombre_tipo()`, `nombre_estado()`, `mostrar_solicitud()` y `mostrar_resultado()` muestran la información. |
 | Comunicación | `crear_meeseeks()` crea los canales y el hijo. `meeseeks()` recibe y atiende la solicitud. `leer_completo()` y `escribir_completo()` completan transferencias parciales y reintentan ante `EINTR`. |
 | Espera | `esperar_proceso()` recoge un hijo específico. `esperar_meeseeks()` también revisa su terminación. |
 | Cálculos | `procesar_calculo()` limita las expresiones admitidas, llama a TinyExpr y comprueba errores. |
 | Programas | `separar_argumentos()` prepara los argumentos. `procesar_programa()` coordina ejecución y tiempo. `ejecutar_programa_hijo()` prepara la entrada y ejecuta. `leer_error_ejecucion()` distingue fallos de lanzamiento de una salida real con código 127. |
+| Medición | `procesar_solicitud()` mide desde antes de crear al Meeseeks hasta recogerlo. `diferencia_segundos()`, `tiempo_sin_simulacion()` y `mostrar_tiempos()` calculan y muestran los tiempos. |
+| Historial | `registrar_solicitud()` reserva y guarda cada petición. `mostrar_informe()` presenta estados, tiempos, detalles y Meeseeks creados. |
 
 ## Bibliotecas y funcionamiento actual
 
@@ -96,27 +100,38 @@ Conservé su código y licencia zlib en `vendor/tinyexpr`, revisión
   `FD_CLOEXEC` comunica fallos al lanzar. Distingo código 0, código de error y
   señal. El tiempo incluye lanzamiento y espera real.
 
-## Pruebas rápidas
+## Medición e informe
 
-Después de compilar, compruebo los cálculos con:
+Uso `CLOCK_MONOTONIC` desde antes de crear al Meeseeks hasta recogerlo, después
+de capturar los datos. Distingo tiempo transcurrido, pausa artificial y tiempo
+sin esa pausa: transcurrido menos espera simulada. No es tiempo de CPU. El
+programa externo conserva además su propia duración.
+
+Por ahora la pausa artificial es cero: configurar una duración no significa
+haberla ejecutado. Al agregar la simulación mediré esa espera; con el árbol
+habrá que evitar sumar pausas simultáneas de hermanos.
+
+El historial se guarda en memoria de la Box y se libera al salir. El informe
+incluye estados, detalles, tiempos y Meeseeks creados por solicitud. Una
+cancelación no se registra y un programa externo no cuenta como otro Meeseeks.
+
+## Prueba rápida
+
+Después de compilar, puedo probar las tres opciones y una cancelación:
 
 ```bash
-printf '%s\n' 2 '5+3*2' 2 '(10+5)/3' 2 '5>3 && !(2==3)' 2 '1/0' 0 | ./build/meeseeks
+printf '%s\n' 2 '5+3*2' 2 '1/0' 3 'pwd' 1 'Prueba textual' 1 45.01 1 0.5 1 'Cancelada' 0 0 | ./build/meeseeks
 ```
 
-Espero 11, 5, 1 y un error de división por cero. Para los programas:
-
-```bash
-printf '%s\n' 3 'pwd' 3 'false' 3 'sh -c "exit 127"' 3 'sh -c "kill -TERM $$"' 3 'programa_no_existe_meeseeks' 0 | ./build/meeseeks
-```
-
-Espero códigos 0, 1 y 127, señal 15 y un fallo al lanzar. Aquí solicito `sh`
-explícitamente para probar sus estados de salida. La Box debe volver al menú
-después de cada solicitud. Son resultados esperados, no mediciones experimentales.
+Espero 4 solicitudes: 2 completadas, 1 no completada y 1 pendiente. Cada una
+muestra tiempos y un Meeseeks creado. Son resultados esperados para comprobar,
+no mediciones experimentales. También puedo probar `false`, `sh -c "exit 127"`
+y un ejecutable inexistente para revisar diferentes errores de programas.
 
 ## Pendiente
 
 Faltan simulación probabilística con aging, árbol de Meeseeks, resolución en
-cascada, contadores compartidos con semáforos, límites y caos planetario. También
-faltan tiempos de los casos A y B, estadísticas finales y experimentos para el
-reporte. Voy actualizando este resumen conforme termino cada etapa.
+cascada, contadores compartidos con semáforos, límites y caos planetario. El
+informe básico ya funciona; falta ampliarlo con las estadísticas del árbol y
+hacer los experimentos para el reporte. Voy actualizando este resumen conforme
+termino cada etapa.

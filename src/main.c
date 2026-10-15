@@ -21,6 +21,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -69,9 +70,18 @@ typedef struct
     pid_t ppid;
     unsigned int nivel;
     unsigned int instancia;
-    double tiempo_real_segundos;
+    unsigned int meeseeks_creados;
+    double tiempo_programa_segundos;
+    double tiempo_espera_simulada_segundos;
     char detalle[MAX_TEXTO];
 } Resultado;
+
+typedef struct
+{
+    Solicitud solicitud;
+    Resultado resultado;
+    double tiempo_transcurrido_segundos;
+} RegistroSolicitud;
 
 static const char *nombre_tipo(TipoSolicitud tipo)
 {
@@ -86,6 +96,63 @@ static const char *nombre_tipo(TipoSolicitud tipo)
         default:
             return "Desconocido";
     }
+}
+
+static const char *nombre_estado(EstadoResultado estado)
+{
+    switch (estado)
+    {
+        case RESULTADO_PENDIENTE:
+            return "pendiente";
+        case RESULTADO_COMPLETADO:
+            return "completada";
+        case RESULTADO_NO_COMPLETADO:
+            return "no completada";
+        default:
+            return "desconocida";
+    }
+}
+
+static double diferencia_segundos(const struct timespec *inicio, const struct timespec *fin)
+{
+    return (double)(fin->tv_sec - inicio->tv_sec) +
+           (double)(fin->tv_nsec - inicio->tv_nsec) / 1000000000.0;
+}
+
+static double tiempo_sin_simulacion(const RegistroSolicitud *registro)
+{
+    if (registro->tiempo_transcurrido_segundos < 0.0)
+        return -1.0;
+
+    double tiempo = registro->tiempo_transcurrido_segundos -
+                    registro->resultado.tiempo_espera_simulada_segundos;
+    return tiempo < 0.0 ? 0.0 : tiempo;
+}
+
+static bool registrar_solicitud(RegistroSolicitud **historial, size_t *cantidad,
+                               const Solicitud *solicitud)
+{
+    if (*cantidad >= SIZE_MAX / sizeof(**historial))
+    {
+        errno = ENOMEM;
+        return false;
+    }
+
+    RegistroSolicitud *nuevo = realloc(*historial, (*cantidad + 1) * sizeof(*nuevo));
+    if (nuevo == NULL)
+        return false;
+
+    *historial = nuevo;
+    RegistroSolicitud *registro = &nuevo[*cantidad];
+    *registro = (RegistroSolicitud){0};
+    registro->solicitud = *solicitud;
+    registro->resultado.estado = RESULTADO_NO_COMPLETADO;
+    registro->resultado.tiempo_programa_segundos = -1.0;
+    registro->tiempo_transcurrido_segundos = -1.0;
+    snprintf(registro->resultado.detalle, sizeof(registro->resultado.detalle),
+             "Fallo al crear, comunicar o recoger el Meeseeks.");
+    (*cantidad)++;
+    return true;
 }
 
 static void limpiar_espacios(char *texto) 
@@ -263,9 +330,9 @@ static bool capturar_datos_textuales(Solicitud *solicitud)
 }
 
 
-static void mostrar_solicitud(const Solicitud *solicitud, unsigned int numero)
+static void mostrar_solicitud(const Solicitud *solicitud, size_t numero)
 {
-    printf("Box: solicitud #%u recibida: \"%s\"\n",
+    printf("Box: solicitud #%zu recibida: \"%s\"\n",
            numero, solicitud->contenido);
     printf("Box: tipo de solicitud: %s\n", nombre_tipo(solicitud->tipo));
 
@@ -640,8 +707,7 @@ static void procesar_programa(const char *contenido, int respuesta, Resultado *r
         return;
     }
 
-    resultado->tiempo_real_segundos = (double)(fin.tv_sec - inicio.tv_sec) +
-                                     (double)(fin.tv_nsec - inicio.tv_nsec) / 1000000000.0;
+    resultado->tiempo_programa_segundos = diferencia_segundos(&inicio, &fin);
 
     if (!comunicado)
         snprintf(resultado->detalle, sizeof(resultado->detalle),
@@ -674,7 +740,8 @@ static int meeseeks(int entrada, int salida, unsigned int nivel, unsigned int in
     resultado.ppid = getppid();
     resultado.nivel = nivel;
     resultado.instancia = instancia;
-    resultado.tiempo_real_segundos = -1.0;
+    resultado.meeseeks_creados = 1;
+    resultado.tiempo_programa_segundos = -1.0;
 
     printf("Hi, I'm Mr. Meeseeks! Look at Meeeee. (%ld, %ld, %u, %u)\n",
            (long)resultado.pid, (long)resultado.ppid, nivel, instancia);
@@ -794,6 +861,12 @@ static bool crear_meeseeks(const Solicitud *solicitud, Resultado *resultado)
         _exit(estado);
     }
 
+    resultado->pid = pid;
+    resultado->ppid = getpid();
+    resultado->nivel = 1;
+    resultado->instancia = 1;
+    resultado->meeseeks_creados = 1;
+
     close(peticion[0]);
     close(respuesta[1]);
 
@@ -803,9 +876,10 @@ static bool crear_meeseeks(const Solicitud *solicitud, Resultado *resultado)
     close(peticion[1]);
 
     /* Recibe antes de waitpid: el hijo puede estar esperando espacio en el pipe. */
+    Resultado respuesta_hijo = {0};
     if (comunicado)
     {
-        comunicado = leer_completo(respuesta[0], resultado, sizeof(*resultado));
+        comunicado = leer_completo(respuesta[0], &respuesta_hijo, sizeof(respuesta_hijo));
         if (!comunicado)
             perror("Error al recibir el resultado");
     }
@@ -813,48 +887,121 @@ static bool crear_meeseeks(const Solicitud *solicitud, Resultado *resultado)
 
     /* Recoge al hijo incluso cuando falla la comunicacion. */
     bool terminado = esperar_meeseeks(pid);
+    if (comunicado && terminado)
+        *resultado = respuesta_hijo;
     return comunicado && terminado;
+}
+
+static bool procesar_solicitud(RegistroSolicitud *registro)
+{
+    struct timespec inicio;
+    if (clock_gettime(CLOCK_MONOTONIC, &inicio) == -1)
+    {
+        perror("Error al iniciar la medicion de la solicitud");
+        snprintf(registro->resultado.detalle, sizeof(registro->resultado.detalle),
+                 "No se pudo iniciar la medicion de la solicitud.");
+        return false;
+    }
+
+    bool procesada = crear_meeseeks(&registro->solicitud, &registro->resultado);
+
+    struct timespec fin;
+    if (clock_gettime(CLOCK_MONOTONIC, &fin) == -1)
+    {
+        perror("Error al terminar la medicion de la solicitud");
+        return false;
+    }
+
+    registro->tiempo_transcurrido_segundos = diferencia_segundos(&inicio, &fin);
+    return procesada;
 }
 
 static void mostrar_resultado(const Resultado *resultado)
 {
-    printf("Box: resultado recibido por pipe de Meeseeks (PID %ld, PPID %ld, N %u, i %u).\n",
-           (long)resultado->pid, (long)resultado->ppid,
-           resultado->nivel, resultado->instancia);
+    if (resultado->pid > 0)
+        printf("Box: Meeseeks asociado (PID %ld, PPID %ld, N %u, i %u).\n",
+               (long)resultado->pid, (long)resultado->ppid,
+               resultado->nivel, resultado->instancia);
+    else
+        puts("Box: no se creo un Meeseeks para esta solicitud.");
 
-    switch (resultado->estado)
-    {
-        case RESULTADO_PENDIENTE:
-            puts("Box: solicitud recibida por el Meeseeks; pendiente de procesar.");
-            break;
-        case RESULTADO_COMPLETADO:
-            puts("Box: solicitud completada.");
-            break;
-        case RESULTADO_NO_COMPLETADO:
-            puts("Box: solicitud no completada.");
-            break;
-    }
+    printf("Box: solicitud %s.\n", nombre_estado(resultado->estado));
 
     if (resultado->detalle[0] != '\0')
         printf("Box: %s\n", resultado->detalle);
+}
 
-    if (resultado->tiempo_real_segundos >= 0.0)
-        printf("Box: tiempo real del programa: %.6f segundos.\n", resultado->tiempo_real_segundos);
+static void mostrar_tiempos(const RegistroSolicitud *registro)
+{
+    if (registro->tiempo_transcurrido_segundos >= 0.0)
+    {
+        printf("Box: tiempo transcurrido de la solicitud: %.6f segundos.\n",
+               registro->tiempo_transcurrido_segundos);
+        printf("Box: espera artificial de simulacion: %.6f segundos.\n",
+               registro->resultado.tiempo_espera_simulada_segundos);
+        printf("Box: tiempo sin espera artificial: %.6f segundos.\n",
+               tiempo_sin_simulacion(registro));
+    }
+    else
+    {
+        puts("Box: medicion de la solicitud no disponible.");
+    }
+
+    if (registro->resultado.tiempo_programa_segundos >= 0.0)
+        printf("Box: tiempo del programa externo: %.6f segundos.\n",
+               registro->resultado.tiempo_programa_segundos);
+}
+
+static void mostrar_informe(const RegistroSolicitud historial[], size_t cantidad)
+{
+    size_t completadas = 0;
+    size_t no_completadas = 0;
+    size_t pendientes = 0;
+
+    for (size_t i = 0; i < cantidad; i++)
+    {
+        switch (historial[i].resultado.estado)
+        {
+            case RESULTADO_COMPLETADO:
+                completadas++;
+                break;
+            case RESULTADO_NO_COMPLETADO:
+                no_completadas++;
+                break;
+            default:
+                pendientes++;
+                break;
+        }
+    }
+
+    puts("\n=== INFORME DE SOLICITUDES ===");
+    printf("Total de solicitudes recibidas: %zu\n", cantidad);
+    printf("Completadas: %zu\nNo completadas: %zu\nPendientes: %zu\n",
+           completadas, no_completadas, pendientes);
+
+    for (size_t i = 0; i < cantidad; i++)
+    {
+        const RegistroSolicitud *registro = &historial[i];
+        printf("\nSolicitud #%zu (%s): \"%s\"\n", i + 1,
+               nombre_tipo(registro->solicitud.tipo), registro->solicitud.contenido);
+        printf("Estado: %s. Meeseeks creados: %u.\n",
+               nombre_estado(registro->resultado.estado), registro->resultado.meeseeks_creados);
+        if (registro->resultado.pid > 0)
+            printf("Meeseeks inicial: (PID %ld, PPID %ld, N %u, i %u).\n",
+                   (long)registro->resultado.pid, (long)registro->resultado.ppid,
+                   registro->resultado.nivel, registro->resultado.instancia);
+        if (registro->resultado.detalle[0] != '\0')
+            printf("Detalle: %s\n", registro->resultado.detalle);
+        mostrar_tiempos(registro);
+    }
 }
 
 static int box(void)
 {
-    //char solicitud[256];
-    //int total = 0;
-    //int fallidas = 0;
-
-    //char *solicitud = NULL;
-    //size_t capacidad = 0;
-    //unsigned int total_solicitudes = 0;
-
     char *texto = NULL;
     size_t capacidad = 0;
-    unsigned int total_solicitudes = 0;
+    RegistroSolicitud *historial = NULL;
+    size_t total_solicitudes = 0;
     int resultado = EXIT_SUCCESS;
 
     /* Un pipe sin lector debe producir EPIPE, sin terminar abruptamente la Box. */
@@ -935,22 +1082,31 @@ static int box(void)
             continue;
         }
 
-        total_solicitudes++;
-        mostrar_solicitud(&solicitud, total_solicitudes);
-
-        Resultado respuesta = {0};
-        if (!crear_meeseeks(&solicitud, &respuesta))
+        if (!registrar_solicitud(&historial, &total_solicitudes, &solicitud))
         {
+            perror("Error al reservar el registro de la solicitud");
             resultado = EXIT_FAILURE;
             break;
         }
 
-        mostrar_resultado(&respuesta);
+        mostrar_solicitud(&solicitud, total_solicitudes);
+
+        RegistroSolicitud *registro = &historial[total_solicitudes - 1];
+        bool procesada = procesar_solicitud(registro);
+        mostrar_resultado(&registro->resultado);
+        mostrar_tiempos(registro);
+
+        if (!procesada)
+        {
+            resultado = EXIT_FAILURE;
+            break;
+        }
     }
 
-    printf("\nTotal de solicitudes recibidas: %u\n", total_solicitudes);
+    mostrar_informe(historial, total_solicitudes);
     puts("Box: ¡Hasta luego!");
     free(texto);
+    free(historial);
     return resultado;
 
 }

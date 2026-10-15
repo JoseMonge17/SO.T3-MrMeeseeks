@@ -26,6 +26,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/mman.h>
+#include <semaphore.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -38,6 +40,11 @@
 
 #define MAX_TEXTO 256
 #define MAX_ARGUMENTOS 32
+#define MAX_PROCESOS 256
+#define PROCESOS_PREDETERMINADOS 128
+#define PLAZO_PREDETERMINADO 300.0
+#define PLAZO_MAXIMO 86400.0
+#define INTERVALO_REVISION 0.01
 
 typedef enum {
     TIPO_TEXTO = 1,
@@ -71,10 +78,29 @@ typedef struct
     unsigned int nivel;
     unsigned int instancia;
     unsigned int meeseeks_creados;
+    unsigned int profundidad_maxima;
+    bool caos_planetario;
     double tiempo_programa_segundos;
     double tiempo_espera_simulada_segundos;
     char detalle[MAX_TEXTO];
 } Resultado;
+
+typedef struct
+{
+    unsigned int max_procesos;
+    double plazo_segundos;
+} Configuracion;
+
+/* Solo los contadores se comparten; las solicitudes siguen viajando por pipes. */
+typedef struct
+{
+    sem_t mutex;
+    unsigned int creados;
+    unsigned int activos;
+    unsigned int profundidad_maxima;
+    Configuracion limites;
+    struct timespec inicio;
+} ControlCompartido;
 
 typedef struct
 {
@@ -117,6 +143,229 @@ static double diferencia_segundos(const struct timespec *inicio, const struct ti
 {
     return (double)(fin->tv_sec - inicio->tv_sec) +
            (double)(fin->tv_nsec - inicio->tv_nsec) / 1000000000.0;
+}
+
+static bool cargar_configuracion(Configuracion *configuracion)
+{
+    *configuracion = (Configuracion){PROCESOS_PREDETERMINADOS, PLAZO_PREDETERMINADO};
+    const char *nombres[] = {"MEESEEKS_MAX_PROCESOS", "MEESEEKS_PLAZO_SEGUNDOS"};
+
+    for (size_t i = 0; i < 2; i++)
+    {
+        const char *texto = getenv(nombres[i]);
+        if (texto == NULL)
+            continue;
+
+        char *fin;
+        errno = 0;
+        double valor = strtod(texto, &fin);
+        if (fin == texto || *fin != '\0' || errno == ERANGE || !isfinite(valor) ||
+            valor <= 0.0 || (i == 0 && (valor > MAX_PROCESOS || floor(valor) != valor)) ||
+            (i == 1 && valor > PLAZO_MAXIMO))
+        {
+            fprintf(stderr, "Configuracion invalida en %s.\n", nombres[i]);
+            return false;
+        }
+
+        if (i == 0)
+            configuracion->max_procesos = (unsigned int)valor;
+        else
+            configuracion->plazo_segundos = valor;
+    }
+    return true;
+}
+
+static bool bloquear_control(ControlCompartido *control)
+{
+    int estado;
+    do
+    {
+        estado = sem_wait(&control->mutex);
+    } while (estado == -1 && errno == EINTR);
+    return estado == 0;
+}
+
+static ControlCompartido *crear_control(const Configuracion *configuracion,
+                                       const struct timespec *inicio)
+{
+    /* /dev/zero permite mmap compartido sin depender de MAP_ANONYMOUS. */
+    int descriptor = open("/dev/zero", O_RDWR);
+    if (descriptor == -1)
+        return NULL;
+    ControlCompartido *control = mmap(NULL, sizeof(*control), PROT_READ | PROT_WRITE,
+                                     MAP_SHARED, descriptor, 0);
+    int error = errno;
+    close(descriptor);
+    if (control == MAP_FAILED)
+    {
+        errno = error;
+        return NULL;
+    }
+
+    *control = (ControlCompartido){0};
+    control->limites = *configuracion;
+    control->inicio = *inicio;
+    if (sem_init(&control->mutex, 1, 1) == -1)
+    {
+        error = errno;
+        munmap(control, sizeof(*control));
+        errno = error;
+        return NULL;
+    }
+    return control;
+}
+
+static double tiempo_disponible(const ControlCompartido *control)
+{
+    struct timespec ahora;
+    if (clock_gettime(CLOCK_MONOTONIC, &ahora) == -1)
+        return -1.0;
+    double restante = control->limites.plazo_segundos -
+                      diferencia_segundos(&control->inicio, &ahora);
+    return fmax(0.0, restante);
+}
+
+static bool reservar_meeseeks(ControlCompartido *control, bool *reservado)
+{
+    double restante = tiempo_disponible(control);
+    if (restante < 0.0 || !bloquear_control(control))
+        return false;
+
+    /* Se reserva antes de fork; nunca se bloquea el semaforo durante fork o IPC. */
+    *reservado = restante > 0.0 && control->creados < control->limites.max_procesos;
+    if (*reservado)
+    {
+        control->creados++;
+        control->activos++;
+    }
+    return sem_post(&control->mutex) == 0;
+}
+
+static bool liberar_meeseeks(ControlCompartido *control, bool fallo_fork)
+{
+    if (!bloquear_control(control))
+        return false;
+    control->activos--;
+    if (fallo_fork)
+        control->creados--;
+    return sem_post(&control->mutex) == 0;
+}
+
+static double facilidad_por_generacion(double facilidad, unsigned int nivel)
+{
+    if (facilidad == 0.0 || nivel == 1)
+        return facilidad;
+    return 100.0 - (100.0 - facilidad) * pow(0.8, (double)(nivel - 1));
+}
+
+static double probabilidad_resolver(double facilidad, unsigned int nivel)
+{
+    double efectiva = facilidad_por_generacion(facilidad, nivel);
+    return efectiva > 85.0 ? 1.0 : pow(efectiva / 100.0, 2.0);
+}
+
+static unsigned int ayuda_necesaria(double facilidad)
+{
+    return facilidad > 85.0 ? 0 : (facilidad <= 45.0 ? 5 : 2);
+}
+
+static double aleatorio_uniforme(unsigned int *semilla)
+{
+    return (double)rand_r(semilla) / ((double)RAND_MAX + 1.0);
+}
+
+static bool esperar_simulacion(double duracion, const ControlCompartido *control,
+                              double *espera_medida)
+{
+    struct timespec inicio;
+    if (clock_gettime(CLOCK_MONOTONIC, &inicio) == -1)
+        return false;
+
+    bool correcto = true;
+    struct timespec ahora = inicio;
+    while (diferencia_segundos(&inicio, &ahora) < duracion)
+    {
+        double restante = tiempo_disponible(control);
+        if (restante < 0.0)
+        {
+            correcto = false;
+            break;
+        }
+        if (restante == 0.0)
+            break;
+
+        double pausa = fmin(INTERVALO_REVISION, fmin(restante,
+                       duracion - diferencia_segundos(&inicio, &ahora)));
+        struct timespec intervalo = {0, (long)ceil(pausa * 1000000000.0)};
+        if (nanosleep(&intervalo, NULL) == -1 && errno != EINTR)
+        {
+            correcto = false;
+            break;
+        }
+        if (clock_gettime(CLOCK_MONOTONIC, &ahora) == -1)
+        {
+            correcto = false;
+            break;
+        }
+    }
+    if (clock_gettime(CLOCK_MONOTONIC, &ahora) == -1)
+        return false;
+    *espera_medida = diferencia_segundos(&inicio, &ahora);
+    return correcto;
+}
+
+static bool procesar_texto(const Solicitud *solicitud, ControlCompartido *control,
+                          Resultado *resultado)
+{
+    struct timespec ahora;
+    if (clock_gettime(CLOCK_MONOTONIC, &ahora) == -1)
+        return false;
+    unsigned int semilla = (unsigned int)ahora.tv_nsec ^ (unsigned int)ahora.tv_sec ^
+                           ((unsigned int)getpid() * 2654435761u) ^ resultado->nivel;
+    double duracion = solicitud->tiempo_aleatorio ?
+                      0.5 + 4.5 * aleatorio_uniforme(&semilla) : solicitud->tiempo_segundos;
+    double probabilidad = probabilidad_resolver(solicitud->facilidad, resultado->nivel);
+    printf("Meeseeks (PID %ld, PPID %ld): facilidad efectiva %.4f, "
+           "probabilidad %.4f%%, simulacion %.4f segundos.\n",
+           (long)resultado->pid, (long)resultado->ppid,
+           facilidad_por_generacion(solicitud->facilidad, resultado->nivel),
+           100.0 * probabilidad, duracion);
+    if (fflush(stdout) == EOF)
+        return false;
+
+    if (!esperar_simulacion(duracion, control, &resultado->tiempo_espera_simulada_segundos))
+        return false;
+    double restante = tiempo_disponible(control);
+    if (restante < 0.0)
+        return false;
+    if (restante == 0.0)
+    {
+        resultado->estado = RESULTADO_NO_COMPLETADO;
+        resultado->caos_planetario = true;
+        snprintf(resultado->detalle, sizeof(resultado->detalle),
+                 "Caos planetario: se alcanzo el plazo de ejecucion.");
+    }
+    else if (solicitud->facilidad > 0.0 && aleatorio_uniforme(&semilla) < probabilidad)
+    {
+        resultado->estado = RESULTADO_COMPLETADO;
+        snprintf(resultado->detalle, sizeof(resultado->detalle),
+                 "Solicitud resuelta por el Meeseeks (PID %ld, PPID %ld, N %u, i %u).",
+                 (long)resultado->pid, (long)resultado->ppid, resultado->nivel, resultado->instancia);
+    }
+    else
+    {
+        if (!bloquear_control(control))
+            return false;
+        unsigned int disponibles = control->limites.max_procesos - control->creados;
+        if (sem_post(&control->mutex) == -1)
+            return false;
+        unsigned int ayuda = ayuda_necesaria(solicitud->facilidad);
+        resultado->estado = disponibles < ayuda ? RESULTADO_NO_COMPLETADO : RESULTADO_PENDIENTE;
+        snprintf(resultado->detalle, sizeof(resultado->detalle),
+                 disponibles < ayuda ? "Presupuesto insuficiente: se necesitan al menos %u hijos." :
+                 "Necesita al menos %u hijos; el arbol se implementara en el siguiente paso.", ayuda);
+    }
+    return true;
 }
 
 static double tiempo_sin_simulacion(const RegistroSolicitud *registro)
@@ -276,8 +525,8 @@ static bool capturar_datos_textuales(Solicitud *solicitud)
 
         if (opcion == 2)
         {
-            /* Distribucion uniforme discreta provisional: 0, 1, ..., 100. */
-            solicitud->facilidad = (double)(rand() % 101);
+            /* Distribucion uniforme sobre la escala, incluyendo decimales. */
+            solicitud->facilidad = 100.0 * (double)rand() / (double)RAND_MAX;
             solicitud->facilidad_aleatoria = true;
             break;
         }
@@ -498,6 +747,57 @@ static bool esperar_proceso(pid_t pid, int *estado)
     return esperado != -1;
 }
 
+static bool terminar_programa(pid_t pid, int *estado)
+{
+    /* El grupo incluye los hijos normales del programa; el Meeseeks queda fuera. */
+    (void)kill(-pid, SIGTERM);
+    (void)kill(pid, SIGTERM);
+    struct timespec gracia = {0, 50000000};
+    while (nanosleep(&gracia, &gracia) == -1 && errno == EINTR)
+    {
+    }
+    (void)kill(-pid, SIGKILL);
+    (void)kill(pid, SIGKILL);
+    return esperar_proceso(pid, estado);
+}
+
+static bool esperar_programa_limitado(pid_t pid, int *estado,
+                                     const ControlCompartido *control, bool *vencido)
+{
+    *vencido = false;
+    while (1)
+    {
+        pid_t esperado = waitpid(pid, estado, WNOHANG);
+        if (esperado == pid)
+            return true;
+        if (esperado == -1)
+        {
+            if (errno == EINTR)
+                continue;
+            return false;
+        }
+
+        double restante = tiempo_disponible(control);
+        if (restante <= 0.0)
+        {
+            int error = errno;
+            bool recogido = terminar_programa(pid, estado);
+            *vencido = restante == 0.0;
+            if (restante < 0.0)
+                errno = error;
+            return restante == 0.0 && recogido;
+        }
+        struct timespec intervalo = {0, (long)ceil(fmin(INTERVALO_REVISION, restante) * 1000000000.0)};
+        if (nanosleep(&intervalo, NULL) == -1 && errno != EINTR)
+        {
+            int error = errno;
+            (void)terminar_programa(pid, estado);
+            errno = error;
+            return false;
+        }
+    }
+}
+
 static bool separar_argumentos(char *comando, char *argumentos[], size_t capacidad,
                               Resultado *resultado)
 {
@@ -602,7 +902,7 @@ static bool leer_error_ejecucion(int descriptor, int *error_ejecucion)
 static void ejecutar_programa_hijo(char *const argumentos[], int errores, int respuesta)
 {
     close(respuesta);
-    int error_ejecucion = 0;
+    int error_ejecucion = setpgid(0, 0) == -1 ? errno : 0;
 
     /* El programa no debe consumir las siguientes opciones de la Box. */
     int entrada = open("/dev/null", O_RDONLY);
@@ -632,7 +932,8 @@ static void ejecutar_programa_hijo(char *const argumentos[], int errores, int re
     _exit(127);
 }
 
-static void procesar_programa(const char *contenido, int respuesta, Resultado *resultado)
+static void procesar_programa(const char *contenido, int respuesta,
+                              ControlCompartido *control, Resultado *resultado)
 {
     resultado->estado = RESULTADO_NO_COMPLETADO;
     char comando[MAX_TEXTO];
@@ -686,18 +987,34 @@ static void procesar_programa(const char *contenido, int respuesta, Resultado *r
     }
 
     close(errores[1]);
+    /* Ambos procesos establecen el grupo para cubrir cualquiera de los dos ordenes. */
+    if (setpgid(pid, pid) == -1 && errno != EACCES && errno != ESRCH)
+    {
+        int error = errno;
+        int estado;
+        (void)terminar_programa(pid, &estado);
+        close(errores[0]);
+        snprintf(resultado->detalle, sizeof(resultado->detalle),
+                 "Error al crear el grupo del programa: %s.", strerror(error));
+        return;
+    }
+
+    int estado;
+    bool vencido;
+    if (!esperar_programa_limitado(pid, &estado, control, &vencido))
+    {
+        int error = errno;
+        close(errores[0]);
+        snprintf(resultado->detalle, sizeof(resultado->detalle),
+                 "Error al esperar el programa: %s.", strerror(error));
+        return;
+    }
+
+    /* Solo se envia un errno: cabe en el pipe aun si esperamos antes de leer. */
     int error_ejecucion = 0;
     bool comunicado = leer_error_ejecucion(errores[0], &error_ejecucion);
     int error_comunicacion = errno;
     close(errores[0]);
-
-    int estado;
-    if (!esperar_proceso(pid, &estado))
-    {
-        snprintf(resultado->detalle, sizeof(resultado->detalle),
-                 "Error al esperar el programa: %s.", strerror(errno));
-        return;
-    }
 
     struct timespec fin;
     if (clock_gettime(CLOCK_MONOTONIC, &fin) == -1)
@@ -709,7 +1026,13 @@ static void procesar_programa(const char *contenido, int respuesta, Resultado *r
 
     resultado->tiempo_programa_segundos = diferencia_segundos(&inicio, &fin);
 
-    if (!comunicado)
+    if (vencido)
+    {
+        resultado->caos_planetario = true;
+        snprintf(resultado->detalle, sizeof(resultado->detalle),
+                 "Caos planetario: plazo agotado; programa terminado y recogido.");
+    }
+    else if (!comunicado)
         snprintf(resultado->detalle, sizeof(resultado->detalle),
                  "Error al recibir el estado de ejecucion: %s.", strerror(error_comunicacion));
     else if (error_ejecucion != 0)
@@ -732,7 +1055,8 @@ static void procesar_programa(const char *contenido, int respuesta, Resultado *r
 }
 
 /* Recibe su solicitud privada y devuelve el resultado a su padre. */
-static int meeseeks(int entrada, int salida, unsigned int nivel, unsigned int instancia)
+static int meeseeks(int entrada, int salida, unsigned int nivel, unsigned int instancia,
+                    ControlCompartido *control)
 {
     Resultado resultado = {0};
     resultado.estado = RESULTADO_PENDIENTE;
@@ -740,8 +1064,21 @@ static int meeseeks(int entrada, int salida, unsigned int nivel, unsigned int in
     resultado.ppid = getppid();
     resultado.nivel = nivel;
     resultado.instancia = instancia;
-    resultado.meeseeks_creados = 1;
     resultado.tiempo_programa_segundos = -1.0;
+    if (!bloquear_control(control))
+    {
+        close(entrada);
+        close(salida);
+        return EXIT_FAILURE;
+    }
+    if (nivel > control->profundidad_maxima)
+        control->profundidad_maxima = nivel;
+    if (sem_post(&control->mutex) == -1)
+    {
+        close(entrada);
+        close(salida);
+        return EXIT_FAILURE;
+    }
 
     printf("Hi, I'm Mr. Meeseeks! Look at Meeeee. (%ld, %ld, %u, %u)\n",
            (long)resultado.pid, (long)resultado.ppid, nivel, instancia);
@@ -763,10 +1100,21 @@ static int meeseeks(int entrada, int salida, unsigned int nivel, unsigned int in
            (long)resultado.pid, (long)resultado.ppid,
            solicitud.contenido, nombre_tipo(solicitud.tipo));
 
-    if (solicitud.tipo == TIPO_CALCULO)
+    bool correcto = true;
+    if (solicitud.tipo == TIPO_TEXTO)
+        correcto = procesar_texto(&solicitud, control, &resultado);
+    else if (solicitud.tipo == TIPO_CALCULO)
         procesar_calculo(solicitud.contenido, &resultado);
     else if (solicitud.tipo == TIPO_PROGRAMA)
-        procesar_programa(solicitud.contenido, salida, &resultado);
+        procesar_programa(solicitud.contenido, salida, control, &resultado);
+
+    if (!correcto)
+    {
+        fprintf(stderr, "Meeseeks (PID %ld, PPID %ld): error en simulacion: %s.\n",
+                (long)resultado.pid, (long)resultado.ppid, strerror(errno));
+        close(salida);
+        return EXIT_FAILURE;
+    }
 
     bool enviado = escribir_completo(salida, &resultado, sizeof(resultado));
     int error_escritura = errno;
@@ -811,7 +1159,8 @@ static bool esperar_meeseeks(pid_t pid)
 }
 
 /* Cada hijo recibe sus propios canales Box -> hijo e hijo -> Box. */
-static bool crear_meeseeks(const Solicitud *solicitud, Resultado *resultado)
+static bool crear_meeseeks(const Solicitud *solicitud, Resultado *resultado,
+                           ControlCompartido *control)
 {
     /* Evita que el hijo vuelva a imprimir la salida pendiente de la Box. */
     if (fflush(stdout) == EOF)
@@ -837,11 +1186,36 @@ static bool crear_meeseeks(const Solicitud *solicitud, Resultado *resultado)
         return false;
     }
 
+    bool reservado = false;
+    bool reserva_correcta = reservar_meeseeks(control, &reservado);
+    if (!reserva_correcta || !reservado)
+    {
+        close(peticion[0]);
+        close(peticion[1]);
+        close(respuesta[0]);
+        close(respuesta[1]);
+        if (!reserva_correcta)
+        {
+            perror("Error al reservar un Meeseeks");
+            return false;
+        }
+        resultado->estado = RESULTADO_NO_COMPLETADO;
+        double restante = tiempo_disponible(control);
+        if (restante < 0.0)
+            return false;
+        resultado->caos_planetario = restante == 0.0;
+        snprintf(resultado->detalle, sizeof(resultado->detalle),
+                 restante == 0.0 ? "Caos planetario: plazo agotado antes de fork." :
+                 "Presupuesto de procesos agotado.");
+        return true;
+    }
+
     pid_t pid = fork();
 
     if (pid == -1)
     {
         perror("Error al crear el Meeseeks");
+        (void)liberar_meeseeks(control, true);
         close(peticion[0]);
         close(peticion[1]);
         close(respuesta[0]);
@@ -853,7 +1227,7 @@ static bool crear_meeseeks(const Solicitud *solicitud, Resultado *resultado)
     {
         close(peticion[1]);
         close(respuesta[0]);
-        int estado = meeseeks(peticion[0], respuesta[1], 1, 1);
+        int estado = meeseeks(peticion[0], respuesta[1], 1, 1, control);
 
         /* El hijo termina aqui: no debe continuar con el menu de la Box. */
         if (fflush(stdout) == EOF)
@@ -887,12 +1261,14 @@ static bool crear_meeseeks(const Solicitud *solicitud, Resultado *resultado)
 
     /* Recoge al hijo incluso cuando falla la comunicacion. */
     bool terminado = esperar_meeseeks(pid);
+    if (!liberar_meeseeks(control, false))
+        return false;
     if (comunicado && terminado)
         *resultado = respuesta_hijo;
     return comunicado && terminado;
 }
 
-static bool procesar_solicitud(RegistroSolicitud *registro)
+static bool procesar_solicitud(RegistroSolicitud *registro, const Configuracion *configuracion)
 {
     struct timespec inicio;
     if (clock_gettime(CLOCK_MONOTONIC, &inicio) == -1)
@@ -903,7 +1279,31 @@ static bool procesar_solicitud(RegistroSolicitud *registro)
         return false;
     }
 
-    bool procesada = crear_meeseeks(&registro->solicitud, &registro->resultado);
+    ControlCompartido *control = crear_control(configuracion, &inicio);
+    if (control == NULL)
+    {
+        perror("Error al crear memoria compartida o semaforo");
+        return false;
+    }
+    bool procesada = crear_meeseeks(&registro->solicitud, &registro->resultado, control);
+    /* El hijo ya fue recogido: solo la Box destruye los recursos compartidos. */
+    registro->resultado.meeseeks_creados = control->creados;
+    registro->resultado.profundidad_maxima = control->profundidad_maxima;
+    if (control->activos != 0)
+    {
+        fputs("Box: contador de procesos activos inconsistente.\n", stderr);
+        procesada = false;
+    }
+    if (sem_destroy(&control->mutex) == -1)
+    {
+        perror("Error al destruir el semaforo");
+        procesada = false;
+    }
+    if (munmap(control, sizeof(*control)) == -1)
+    {
+        perror("Error al liberar memoria compartida");
+        procesada = false;
+    }
 
     struct timespec fin;
     if (clock_gettime(CLOCK_MONOTONIC, &fin) == -1)
@@ -926,6 +1326,8 @@ static void mostrar_resultado(const Resultado *resultado)
         puts("Box: no se creo un Meeseeks para esta solicitud.");
 
     printf("Box: solicitud %s.\n", nombre_estado(resultado->estado));
+    printf("Box: Meeseeks creados: %u. Profundidad maxima: %u.\n",
+           resultado->meeseeks_creados, resultado->profundidad_maxima);
 
     if (resultado->detalle[0] != '\0')
         printf("Box: %s\n", resultado->detalle);
@@ -986,6 +1388,9 @@ static void mostrar_informe(const RegistroSolicitud historial[], size_t cantidad
                nombre_tipo(registro->solicitud.tipo), registro->solicitud.contenido);
         printf("Estado: %s. Meeseeks creados: %u.\n",
                nombre_estado(registro->resultado.estado), registro->resultado.meeseeks_creados);
+        printf("Profundidad maxima: %u. Caos planetario: %s.\n",
+               registro->resultado.profundidad_maxima,
+               registro->resultado.caos_planetario ? "si" : "no");
         if (registro->resultado.pid > 0)
             printf("Meeseeks inicial: (PID %ld, PPID %ld, N %u, i %u).\n",
                    (long)registro->resultado.pid, (long)registro->resultado.ppid,
@@ -1003,6 +1408,11 @@ static int box(void)
     RegistroSolicitud *historial = NULL;
     size_t total_solicitudes = 0;
     int resultado = EXIT_SUCCESS;
+    Configuracion configuracion;
+    if (!cargar_configuracion(&configuracion))
+        return EXIT_FAILURE;
+    printf("Box: limites por solicitud: %u Meeseeks, %.3f segundos.\n",
+           configuracion.max_procesos, configuracion.plazo_segundos);
 
     /* Un pipe sin lector debe producir EPIPE, sin terminar abruptamente la Box. */
     struct sigaction accion = {0};
@@ -1092,7 +1502,7 @@ static int box(void)
         mostrar_solicitud(&solicitud, total_solicitudes);
 
         RegistroSolicitud *registro = &historial[total_solicitudes - 1];
-        bool procesada = procesar_solicitud(registro);
+        bool procesada = procesar_solicitud(registro, &configuracion);
         mostrar_resultado(&registro->resultado);
         mostrar_tiempos(registro);
 

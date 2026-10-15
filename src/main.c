@@ -21,6 +21,8 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
+#include <stdarg.h>
+#include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,6 +47,7 @@
 #define PLAZO_PREDETERMINADO 300.0
 #define PLAZO_MAXIMO 86400.0
 #define INTERVALO_REVISION 0.01
+#define MAX_HIJOS 5
 
 typedef enum {
     TIPO_TEXTO = 1,
@@ -69,6 +72,35 @@ typedef enum
     RESULTADO_NO_COMPLETADO
 } EstadoResultado;
 
+typedef struct
+{
+    pid_t pid;
+    pid_t ppid;
+    unsigned int nivel;
+    unsigned int instancia;
+} IdentidadMeeseeks;
+
+typedef enum
+{
+    AVISO_NINGUNO,
+    AVISO_RESUELTO,
+    AVISO_PLAZO,
+    AVISO_ERROR
+} MotivoAviso;
+
+typedef struct
+{
+    MotivoAviso motivo;
+    IdentidadMeeseeks ganador;
+} AvisoCancelacion;
+
+typedef struct
+{
+    pid_t pid;
+    int envio;
+    int recepcion;
+} HijoMeeseeks;
+
 /* Respuesta privada del Meeseeks; no contiene punteros a memoria del hijo. */
 typedef struct
 {
@@ -80,6 +112,7 @@ typedef struct
     unsigned int meeseeks_creados;
     unsigned int profundidad_maxima;
     bool caos_planetario;
+    IdentidadMeeseeks ganador;
     double tiempo_programa_segundos;
     double tiempo_espera_simulada_segundos;
     char detalle[MAX_TEXTO];
@@ -108,6 +141,69 @@ typedef struct
     Resultado resultado;
     double tiempo_transcurrido_segundos;
 } RegistroSolicitud;
+
+static bool escribir_completo(int descriptor, const void *datos, size_t cantidad);
+static bool leer_completo(int descriptor, void *datos, size_t cantidad);
+static int meeseeks(int entrada, int salida, unsigned int nivel, unsigned int instancia,
+                    ControlCompartido *control);
+
+static void imprimir_linea(unsigned int nivel, const char *texto)
+{
+    char linea[1024];
+    size_t sangria = nivel > 0 ? nivel - 1 : 0;
+    if (sangria > MAX_PROCESOS)
+        sangria = MAX_PROCESOS;
+    memset(linea, '\t', sangria);
+    int longitud = snprintf(linea + sangria, sizeof(linea) - sangria, "%s\n", texto);
+    if (longitud >= 0 && (size_t)longitud < sizeof(linea) - sangria)
+        (void)escribir_completo(STDOUT_FILENO, linea, sangria + (size_t)longitud);
+}
+
+static void mensaje_meeseeks(const Resultado *resultado, const char *formato, ...)
+{
+    char mensaje[640];
+    va_list argumentos;
+    va_start(argumentos, formato);
+    vsnprintf(mensaje, sizeof(mensaje), formato, argumentos);
+    va_end(argumentos);
+
+    char texto[768];
+    snprintf(texto, sizeof(texto), "Meeseeks (PID %ld, PPID %ld): %s",
+             (long)resultado->pid, (long)resultado->ppid, mensaje);
+    imprimir_linea(resultado->nivel, texto);
+}
+
+static void aplicar_cancelacion(Resultado *resultado, const AvisoCancelacion *aviso)
+{
+    resultado->estado = RESULTADO_NO_COMPLETADO;
+    resultado->caos_planetario = aviso->motivo == AVISO_PLAZO;
+    resultado->ganador = aviso->ganador;
+    if (aviso->motivo == AVISO_RESUELTO)
+        snprintf(resultado->detalle, sizeof(resultado->detalle),
+                 "Trabajo cancelado: gano el Meeseeks PID %ld.", (long)aviso->ganador.pid);
+    else if (aviso->motivo == AVISO_PLAZO)
+        snprintf(resultado->detalle, sizeof(resultado->detalle),
+                 "Caos planetario: se alcanzo el plazo de ejecucion.");
+    else
+        snprintf(resultado->detalle, sizeof(resultado->detalle),
+                 "Cancelacion por error o cierre del pipe del padre.");
+}
+
+static bool recibir_aviso(int entrada, AvisoCancelacion *aviso)
+{
+    if (!leer_completo(entrada, aviso, sizeof(*aviso)))
+    {
+        *aviso = (AvisoCancelacion){.motivo = AVISO_ERROR};
+        return false;
+    }
+    if (aviso->motivo < AVISO_RESUELTO || aviso->motivo > AVISO_ERROR)
+    {
+        *aviso = (AvisoCancelacion){.motivo = AVISO_ERROR};
+        errno = EPROTO;
+        return false;
+    }
+    return true;
+}
 
 static const char *nombre_tipo(TipoSolicitud tipo)
 {
@@ -225,29 +321,29 @@ static double tiempo_disponible(const ControlCompartido *control)
     return fmax(0.0, restante);
 }
 
-static bool reservar_meeseeks(ControlCompartido *control, bool *reservado)
+static bool reservar_meeseeks(ControlCompartido *control, unsigned int cantidad, bool *reservado)
 {
     double restante = tiempo_disponible(control);
     if (restante < 0.0 || !bloquear_control(control))
         return false;
 
     /* Se reserva antes de fork; nunca se bloquea el semaforo durante fork o IPC. */
-    *reservado = restante > 0.0 && control->creados < control->limites.max_procesos;
+    *reservado = restante > 0.0 && cantidad <= control->limites.max_procesos - control->creados;
     if (*reservado)
     {
-        control->creados++;
-        control->activos++;
+        control->creados += cantidad;
+        control->activos += cantidad;
     }
     return sem_post(&control->mutex) == 0;
 }
 
-static bool liberar_meeseeks(ControlCompartido *control, bool fallo_fork)
+static bool liberar_meeseeks(ControlCompartido *control, unsigned int cantidad, bool fallo_fork)
 {
     if (!bloquear_control(control))
         return false;
-    control->activos--;
+    control->activos -= cantidad;
     if (fallo_fork)
-        control->creados--;
+        control->creados -= cantidad;
     return sem_post(&control->mutex) == 0;
 }
 
@@ -275,7 +371,7 @@ static double aleatorio_uniforme(unsigned int *semilla)
 }
 
 static bool esperar_simulacion(double duracion, const ControlCompartido *control,
-                              double *espera_medida)
+                              int entrada, double *espera_medida, AvisoCancelacion *aviso)
 {
     struct timespec inicio;
     if (clock_gettime(CLOCK_MONOTONIC, &inicio) == -1)
@@ -283,7 +379,7 @@ static bool esperar_simulacion(double duracion, const ControlCompartido *control
 
     bool correcto = true;
     struct timespec ahora = inicio;
-    while (diferencia_segundos(&inicio, &ahora) < duracion)
+    while (1)
     {
         double restante = tiempo_disponible(control);
         if (restante < 0.0)
@@ -292,19 +388,46 @@ static bool esperar_simulacion(double duracion, const ControlCompartido *control
             break;
         }
         if (restante == 0.0)
+        {
+            aviso->motivo = AVISO_PLAZO;
             break;
-
-        double pausa = fmin(INTERVALO_REVISION, fmin(restante,
-                       duracion - diferencia_segundos(&inicio, &ahora)));
-        struct timespec intervalo = {0, (long)ceil(pausa * 1000000000.0)};
-        if (nanosleep(&intervalo, NULL) == -1 && errno != EINTR)
+        }
+        double pendiente = duracion - diferencia_segundos(&inicio, &ahora);
+        /* poll permite despertar por un aviso, sin esperar a que termine la pausa. */
+        int milisegundos = pendiente <= 0.0 ? 0 : (int)ceil(fmin(pendiente, restante) * 1000.0);
+        struct pollfd canal = {.fd = entrada, .events = POLLIN};
+        int eventos = poll(&canal, 1, milisegundos);
+        if (eventos == -1 && errno == EINTR)
+        {
+            if (clock_gettime(CLOCK_MONOTONIC, &ahora) == -1)
+            {
+                correcto = false;
+                break;
+            }
+            continue;
+        }
+        if (eventos == -1 || (canal.revents & (POLLERR | POLLNVAL)))
         {
             correcto = false;
+            break;
+        }
+        if (canal.revents & (POLLIN | POLLHUP))
+        {
+            correcto = recibir_aviso(entrada, aviso);
             break;
         }
         if (clock_gettime(CLOCK_MONOTONIC, &ahora) == -1)
         {
             correcto = false;
+            break;
+        }
+        if (diferencia_segundos(&inicio, &ahora) >= duracion)
+        {
+            restante = tiempo_disponible(control);
+            if (restante < 0.0)
+                correcto = false;
+            else if (restante == 0.0)
+                aviso->motivo = AVISO_PLAZO;
             break;
         }
     }
@@ -314,8 +437,8 @@ static bool esperar_simulacion(double duracion, const ControlCompartido *control
     return correcto;
 }
 
-static bool procesar_texto(const Solicitud *solicitud, ControlCompartido *control,
-                          Resultado *resultado)
+static bool procesar_texto(const Solicitud *solicitud, int entrada,
+                          ControlCompartido *control, Resultado *resultado)
 {
     struct timespec ahora;
     if (clock_gettime(CLOCK_MONOTONIC, &ahora) == -1)
@@ -325,45 +448,35 @@ static bool procesar_texto(const Solicitud *solicitud, ControlCompartido *contro
     double duracion = solicitud->tiempo_aleatorio ?
                       0.5 + 4.5 * aleatorio_uniforme(&semilla) : solicitud->tiempo_segundos;
     double probabilidad = probabilidad_resolver(solicitud->facilidad, resultado->nivel);
-    printf("Meeseeks (PID %ld, PPID %ld): facilidad efectiva %.4f, "
-           "probabilidad %.4f%%, simulacion %.4f segundos.\n",
-           (long)resultado->pid, (long)resultado->ppid,
-           facilidad_por_generacion(solicitud->facilidad, resultado->nivel),
-           100.0 * probabilidad, duracion);
-    if (fflush(stdout) == EOF)
-        return false;
+    mensaje_meeseeks(resultado, "facilidad efectiva %.4f, probabilidad %.4f%%, simulacion %.4f segundos.",
+                     facilidad_por_generacion(solicitud->facilidad, resultado->nivel),
+                     100.0 * probabilidad, duracion);
 
-    if (!esperar_simulacion(duracion, control, &resultado->tiempo_espera_simulada_segundos))
+    AvisoCancelacion aviso = {0};
+    if (!esperar_simulacion(duracion, control, entrada,
+                           &resultado->tiempo_espera_simulada_segundos, &aviso))
         return false;
-    double restante = tiempo_disponible(control);
-    if (restante < 0.0)
-        return false;
-    if (restante == 0.0)
+    if (aviso.motivo != AVISO_NINGUNO)
     {
-        resultado->estado = RESULTADO_NO_COMPLETADO;
-        resultado->caos_planetario = true;
-        snprintf(resultado->detalle, sizeof(resultado->detalle),
-                 "Caos planetario: se alcanzo el plazo de ejecucion.");
+        aplicar_cancelacion(resultado, &aviso);
+        mensaje_meeseeks(resultado, "%s", resultado->detalle);
+        return aviso.motivo != AVISO_ERROR;
     }
-    else if (solicitud->facilidad > 0.0 && aleatorio_uniforme(&semilla) < probabilidad)
+
+    if (solicitud->facilidad > 0.0 && aleatorio_uniforme(&semilla) < probabilidad)
     {
         resultado->estado = RESULTADO_COMPLETADO;
+        resultado->ganador = (IdentidadMeeseeks){resultado->pid, resultado->ppid,
+                                               resultado->nivel, resultado->instancia};
         snprintf(resultado->detalle, sizeof(resultado->detalle),
                  "Solicitud resuelta por el Meeseeks (PID %ld, PPID %ld, N %u, i %u).",
                  (long)resultado->pid, (long)resultado->ppid, resultado->nivel, resultado->instancia);
+        mensaje_meeseeks(resultado, "Resolvi la solicitud; informare a mi padre por pipe.");
     }
     else
     {
-        if (!bloquear_control(control))
-            return false;
-        unsigned int disponibles = control->limites.max_procesos - control->creados;
-        if (sem_post(&control->mutex) == -1)
-            return false;
-        unsigned int ayuda = ayuda_necesaria(solicitud->facilidad);
-        resultado->estado = disponibles < ayuda ? RESULTADO_NO_COMPLETADO : RESULTADO_PENDIENTE;
-        snprintf(resultado->detalle, sizeof(resultado->detalle),
-                 disponibles < ayuda ? "Presupuesto insuficiente: se necesitan al menos %u hijos." :
-                 "Necesita al menos %u hijos; el arbol se implementara en el siguiente paso.", ayuda);
+        resultado->estado = RESULTADO_PENDIENTE;
+        mensaje_meeseeks(resultado, "Necesito ayuda de %u hijos.", ayuda_necesaria(solicitud->facilidad));
     }
     return true;
 }
@@ -1054,6 +1167,295 @@ static void procesar_programa(const char *contenido, int respuesta,
                  "El programa termino con un estado inesperado.");
 }
 
+static bool iniciar_hijo(const Solicitud *solicitud, unsigned int nivel, unsigned int instancia,
+                         int entrada_padre, int salida_padre, HijoMeeseeks hermanos[],
+                         unsigned int cantidad_hermanos, HijoMeeseeks *hijo,
+                         ControlCompartido *control)
+{
+    int peticion[2];
+    int respuesta[2];
+    *hijo = (HijoMeeseeks){.envio = -1, .recepcion = -1};
+    if (pipe(peticion) == -1)
+        return false;
+    if (pipe(respuesta) == -1)
+    {
+        int error = errno;
+        close(peticion[0]);
+        close(peticion[1]);
+        errno = error;
+        return false;
+    }
+
+    pid_t pid = fork();
+    if (pid == -1)
+    {
+        int error = errno;
+        close(peticion[0]);
+        close(peticion[1]);
+        close(respuesta[0]);
+        close(respuesta[1]);
+        errno = error;
+        return false;
+    }
+    if (pid == 0)
+    {
+        close(peticion[1]);
+        close(respuesta[0]);
+        /* El nieto no debe conservar canales de sus tios ni de sus abuelos. */
+        if (entrada_padre >= 0)
+            close(entrada_padre);
+        if (salida_padre >= 0)
+            close(salida_padre);
+        for (unsigned int i = 0; i < cantidad_hermanos; i++)
+        {
+            if (hermanos[i].envio >= 0)
+                close(hermanos[i].envio);
+            if (hermanos[i].recepcion >= 0)
+                close(hermanos[i].recepcion);
+        }
+        int estado = meeseeks(peticion[0], respuesta[1], nivel, instancia, control);
+        if (fflush(stdout) == EOF)
+            estado = EXIT_FAILURE;
+        _exit(estado);
+    }
+
+    hijo->pid = pid;
+    hijo->envio = peticion[1];
+    hijo->recepcion = respuesta[0];
+    close(peticion[0]);
+    close(respuesta[1]);
+    if (!escribir_completo(hijo->envio, solicitud, sizeof(*solicitud)))
+    {
+        int error = errno;
+        close(hijo->envio);
+        hijo->envio = -1;
+        errno = error;
+        return false;
+    }
+    return true;
+}
+
+static bool avisar_hijos(HijoMeeseeks hijos[], unsigned int cantidad,
+                        const AvisoCancelacion *aviso, const Resultado *padre)
+{
+    bool correcto = true;
+    for (unsigned int i = 0; i < cantidad; i++)
+    {
+        if (hijos[i].pid == 0 || hijos[i].envio < 0)
+            continue;
+        if (!escribir_completo(hijos[i].envio, aviso, sizeof(*aviso)))
+        {
+            /* Un hijo que ya envio su resultado puede haber cerrado el lector. */
+            if (errno != EPIPE)
+                correcto = false;
+            close(hijos[i].envio);
+            hijos[i].envio = -1;
+        }
+        else if (aviso->motivo == AVISO_RESUELTO)
+            mensaje_meeseeks(padre, "Aviso por pipe a hijo PID %ld: gano PID %ld; deten tu subarbol.",
+                             (long)hijos[i].pid, (long)aviso->ganador.pid);
+        else
+            mensaje_meeseeks(padre, "Aviso por pipe a hijo PID %ld: cancelar por %s.",
+                             (long)hijos[i].pid, aviso->motivo == AVISO_PLAZO ? "plazo" : "error");
+    }
+    return correcto;
+}
+
+static bool recoger_hijo(HijoMeeseeks *hijo, ControlCompartido *control,
+                         Resultado *respuesta, const Resultado *padre)
+{
+    Resultado mensaje = {0};
+    bool recibido = leer_completo(hijo->recepcion, &mensaje, sizeof(mensaje));
+    int error = errno;
+    if (recibido)
+        *respuesta = mensaje;
+    close(hijo->recepcion);
+    hijo->recepcion = -1;
+    int estado = 0;
+    bool recogido = esperar_proceso(hijo->pid, &estado);
+    if (hijo->envio >= 0)
+        close(hijo->envio);
+    hijo->envio = -1;
+    bool liberado = liberar_meeseeks(control, 1, false);
+    mensaje_meeseeks(padre, "Recogi con waitpid al hijo PID %ld.", (long)hijo->pid);
+    hijo->pid = 0;
+    if (!recibido)
+        mensaje_meeseeks(padre, "Error al recibir resultado del hijo: %s.", strerror(error));
+    return recibido && recogido && liberado && WIFEXITED(estado) && WEXITSTATUS(estado) == EXIT_SUCCESS;
+}
+
+/* Cada padre supervisa solo sus hijos directos; cada hijo hace lo mismo con su subarbol. */
+static bool esperar_hijos(int entrada, HijoMeeseeks hijos[], unsigned int cantidad,
+                          ControlCompartido *control, Resultado *resultado,
+                          AvisoCancelacion aviso)
+{
+    bool correcto = aviso.motivo != AVISO_ERROR;
+    bool vigilar_padre = true;
+    unsigned int pendientes = cantidad;
+    double mayor_espera = 0.0;
+    if (aviso.motivo != AVISO_NINGUNO)
+    {
+        aplicar_cancelacion(resultado, &aviso);
+        if (!avisar_hijos(hijos, cantidad, &aviso, resultado))
+            correcto = false;
+    }
+
+    while (pendientes > 0)
+    {
+        double restante = tiempo_disponible(control);
+        if (aviso.motivo == AVISO_NINGUNO && restante <= 0.0)
+        {
+            aviso.motivo = restante == 0.0 ? AVISO_PLAZO : AVISO_ERROR;
+            correcto = correcto && restante == 0.0;
+            aplicar_cancelacion(resultado, &aviso);
+            if (!avisar_hijos(hijos, cantidad, &aviso, resultado))
+                correcto = false;
+        }
+
+        struct pollfd canales[MAX_HIJOS + 1] = {0};
+        canales[0] = (struct pollfd){.fd = vigilar_padre ? entrada : -1, .events = POLLIN};
+        for (unsigned int i = 0; i < cantidad; i++)
+            canales[i + 1] = (struct pollfd){.fd = hijos[i].recepcion, .events = POLLIN};
+        int plazo = aviso.motivo == AVISO_NINGUNO ? (int)ceil(restante * 1000.0) : -1;
+        int eventos = poll(canales, cantidad + 1, plazo);
+        if (eventos == -1 && errno == EINTR)
+            continue;
+        if (eventos == -1)
+        {
+            /* Aun si falla poll, se ordena el cierre y se recoge cada hijo. */
+            correcto = false;
+            aviso.motivo = AVISO_ERROR;
+            aplicar_cancelacion(resultado, &aviso);
+            (void)avisar_hijos(hijos, cantidad, &aviso, resultado);
+            for (unsigned int i = 0; i < cantidad; i++)
+            {
+                if (hijos[i].pid == 0)
+                    continue;
+                Resultado respuesta = {0};
+                (void)recoger_hijo(&hijos[i], control, &respuesta, resultado);
+                mayor_espera = fmax(mayor_espera, respuesta.tiempo_espera_simulada_segundos);
+            }
+            break;
+        }
+
+        if (canales[0].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))
+        {
+            if (!recibir_aviso(entrada, &aviso))
+                correcto = false;
+            vigilar_padre = false;
+            aplicar_cancelacion(resultado, &aviso);
+            mensaje_meeseeks(resultado, "Recibi cancelacion de mi padre; aviso a mis descendientes.");
+            if (aviso.motivo == AVISO_ERROR)
+                correcto = false;
+            if (!avisar_hijos(hijos, cantidad, &aviso, resultado))
+                correcto = false;
+        }
+
+        for (unsigned int i = 0; i < cantidad; i++)
+        {
+            if (hijos[i].pid == 0 || canales[i + 1].revents == 0)
+                continue;
+            if (canales[i + 1].revents & (POLLERR | POLLNVAL))
+            {
+                correcto = false;
+                aviso.motivo = AVISO_ERROR;
+                aplicar_cancelacion(resultado, &aviso);
+                (void)avisar_hijos(hijos, cantidad, &aviso, resultado);
+            }
+            Resultado respuesta = {0};
+            bool recogido = recoger_hijo(&hijos[i], control, &respuesta, resultado);
+            pendientes--;
+            mayor_espera = fmax(mayor_espera, respuesta.tiempo_espera_simulada_segundos);
+            if (!recogido)
+            {
+                correcto = false;
+                aviso.motivo = AVISO_ERROR;
+                aplicar_cancelacion(resultado, &aviso);
+                (void)avisar_hijos(hijos, cantidad, &aviso, resultado);
+            }
+            else if (aviso.motivo == AVISO_NINGUNO && respuesta.estado == RESULTADO_COMPLETADO)
+            {
+                resultado->estado = RESULTADO_COMPLETADO;
+                resultado->ganador = respuesta.ganador;
+                snprintf(resultado->detalle, sizeof(resultado->detalle), "%s", respuesta.detalle);
+                aviso = (AvisoCancelacion){AVISO_RESUELTO, respuesta.ganador};
+                mensaje_meeseeks(resultado, "Hijo informo por pipe: gano PID %ld. Aviso a sus hermanos.",
+                                 (long)respuesta.ganador.pid);
+                if (!avisar_hijos(hijos, cantidad, &aviso, resultado))
+                    correcto = false;
+            }
+            else if (aviso.motivo == AVISO_NINGUNO && respuesta.caos_planetario)
+            {
+                aviso.motivo = AVISO_PLAZO;
+                aplicar_cancelacion(resultado, &aviso);
+                if (!avisar_hijos(hijos, cantidad, &aviso, resultado))
+                    correcto = false;
+            }
+        }
+    }
+
+    /* Las pausas de hermanos se superponen: se conserva el mayor camino de pausas. */
+    resultado->tiempo_espera_simulada_segundos += mayor_espera;
+    if (aviso.motivo == AVISO_NINGUNO)
+    {
+        resultado->estado = RESULTADO_NO_COMPLETADO;
+        snprintf(resultado->detalle, sizeof(resultado->detalle),
+                 "Ningun descendiente resolvio la solicitud dentro del presupuesto.");
+    }
+    return correcto;
+}
+
+static bool solicitar_ayuda(const Solicitud *solicitud, int entrada, int salida,
+                           ControlCompartido *control, Resultado *resultado)
+{
+    unsigned int cantidad = ayuda_necesaria(solicitud->facilidad);
+    bool reservado = false;
+    if (!reservar_meeseeks(control, cantidad, &reservado))
+        return false;
+    if (!reservado)
+    {
+        double restante = tiempo_disponible(control);
+        if (restante < 0.0)
+            return false;
+        AvisoCancelacion aviso = {.motivo = AVISO_PLAZO};
+        if (restante == 0.0)
+            aplicar_cancelacion(resultado, &aviso);
+        else
+        {
+            resultado->estado = RESULTADO_NO_COMPLETADO;
+            snprintf(resultado->detalle, sizeof(resultado->detalle),
+                     "Presupuesto insuficiente para crear el grupo de %u hijos.", cantidad);
+        }
+        mensaje_meeseeks(resultado, "%s", resultado->detalle);
+        return true;
+    }
+
+    HijoMeeseeks hijos[MAX_HIJOS];
+    unsigned int creados = 0;
+    bool correcto = true;
+    for (unsigned int i = 0; i < cantidad; i++)
+    {
+        bool iniciado = iniciar_hijo(solicitud, resultado->nivel + 1, i + 1,
+                                     entrada, salida, hijos, creados, &hijos[i], control);
+        if (hijos[i].pid > 0)
+        {
+            creados++;
+            mensaje_meeseeks(resultado, "Cree hijo PID %ld (N %u, i %u).",
+                             (long)hijos[i].pid, resultado->nivel + 1, i + 1);
+        }
+        if (!iniciado)
+        {
+            mensaje_meeseeks(resultado, "Error al crear o enviar solicitud al hijo: %s.", strerror(errno));
+            correcto = false;
+            break;
+        }
+    }
+    if (creados < cantidad && !liberar_meeseeks(control, cantidad - creados, true))
+        correcto = false;
+    AvisoCancelacion aviso = {.motivo = correcto ? AVISO_NINGUNO : AVISO_ERROR};
+    return esperar_hijos(entrada, hijos, creados, control, resultado, aviso) && correcto;
+}
+
 /* Recibe su solicitud privada y devuelve el resultado a su padre. */
 static int meeseeks(int entrada, int salida, unsigned int nivel, unsigned int instancia,
                     ControlCompartido *control)
@@ -1080,56 +1482,46 @@ static int meeseeks(int entrada, int salida, unsigned int nivel, unsigned int in
         return EXIT_FAILURE;
     }
 
-    printf("Hi, I'm Mr. Meeseeks! Look at Meeeee. (%ld, %ld, %u, %u)\n",
-           (long)resultado.pid, (long)resultado.ppid, nivel, instancia);
+    char saludo[160];
+    snprintf(saludo, sizeof(saludo), "Hi, I'm Mr. Meeseeks! Look at Meeeee. (%ld, %ld, %u, %u)",
+             (long)resultado.pid, (long)resultado.ppid, nivel, instancia);
+    imprimir_linea(nivel, saludo);
 
     Solicitud solicitud = {0};
-    bool recibida = leer_completo(entrada, &solicitud, sizeof(solicitud));
-    int error_lectura = errno;
-    close(entrada);
-
-    if (!recibida)
+    bool correcto = leer_completo(entrada, &solicitud, sizeof(solicitud));
+    if (correcto)
     {
-        fprintf(stderr, "Meeseeks (PID %ld, PPID %ld): error al recibir solicitud: %s.\n",
-                (long)resultado.pid, (long)resultado.ppid, strerror(error_lectura));
-        close(salida);
-        return EXIT_FAILURE;
+        mensaje_meeseeks(&resultado, "Recibi por pipe la solicitud \"%s\" (%s).",
+                         solicitud.contenido, nombre_tipo(solicitud.tipo));
+        if (solicitud.tipo == TIPO_TEXTO)
+        {
+            correcto = procesar_texto(&solicitud, entrada, control, &resultado);
+            if (correcto && resultado.estado == RESULTADO_PENDIENTE)
+                correcto = solicitar_ayuda(&solicitud, entrada, salida, control, &resultado);
+        }
+        else if (solicitud.tipo == TIPO_CALCULO)
+            procesar_calculo(solicitud.contenido, &resultado);
+        else if (solicitud.tipo == TIPO_PROGRAMA)
+            procesar_programa(solicitud.contenido, salida, control, &resultado);
+
+        if (resultado.estado == RESULTADO_COMPLETADO && resultado.ganador.pid == 0)
+            resultado.ganador = (IdentidadMeeseeks){resultado.pid, resultado.ppid, nivel, instancia};
     }
-
-    printf("Meeseeks (PID %ld, PPID %ld): recibi por pipe la solicitud \"%s\" (%s).\n",
-           (long)resultado.pid, (long)resultado.ppid,
-           solicitud.contenido, nombre_tipo(solicitud.tipo));
-
-    bool correcto = true;
-    if (solicitud.tipo == TIPO_TEXTO)
-        correcto = procesar_texto(&solicitud, control, &resultado);
-    else if (solicitud.tipo == TIPO_CALCULO)
-        procesar_calculo(solicitud.contenido, &resultado);
-    else if (solicitud.tipo == TIPO_PROGRAMA)
-        procesar_programa(solicitud.contenido, salida, control, &resultado);
-
     if (!correcto)
     {
-        fprintf(stderr, "Meeseeks (PID %ld, PPID %ld): error en simulacion: %s.\n",
-                (long)resultado.pid, (long)resultado.ppid, strerror(errno));
-        close(salida);
-        return EXIT_FAILURE;
+        mensaje_meeseeks(&resultado, "Error en la solicitud o en sus descendientes; termino la atencion.");
+        resultado.estado = RESULTADO_NO_COMPLETADO;
+        snprintf(resultado.detalle, sizeof(resultado.detalle),
+                 "Error interno; los hijos creados fueron recogidos.");
     }
+    close(entrada);
 
     bool enviado = escribir_completo(salida, &resultado, sizeof(resultado));
-    int error_escritura = errno;
-    close(salida);
-
     if (!enviado)
-    {
-        fprintf(stderr, "Meeseeks (PID %ld, PPID %ld): error al enviar resultado: %s.\n",
-                (long)resultado.pid, (long)resultado.ppid, strerror(error_escritura));
-        return EXIT_FAILURE;
-    }
-
-    printf("Meeseeks (PID %ld, PPID %ld): Hasta luego. Resultado enviado a la Box.\n",
-           (long)resultado.pid, (long)resultado.ppid);
-    return EXIT_SUCCESS;
+        mensaje_meeseeks(&resultado, "Error al enviar resultado: %s.", strerror(errno));
+    close(salida);
+    mensaje_meeseeks(&resultado, "Hasta luego. Descendientes recogidos; resultado enviado al padre.");
+    return correcto && enviado ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
 static bool esperar_meeseeks(pid_t pid)
@@ -1158,47 +1550,20 @@ static bool esperar_meeseeks(pid_t pid)
     return true;
 }
 
-/* Cada hijo recibe sus propios canales Box -> hijo e hijo -> Box. */
+/* La Box usa los mismos canales privados que los padres del arbol. */
 static bool crear_meeseeks(const Solicitud *solicitud, Resultado *resultado,
                            ControlCompartido *control)
 {
-    /* Evita que el hijo vuelva a imprimir la salida pendiente de la Box. */
     if (fflush(stdout) == EOF)
     {
         perror("Error al mostrar la salida de la Box");
         return false;
     }
-
-    int peticion[2];
-    int respuesta[2];
-
-    if (pipe(peticion) == -1)
-    {
-        perror("Error al crear el pipe de solicitud");
-        return false;
-    }
-
-    if (pipe(respuesta) == -1)
-    {
-        perror("Error al crear el pipe de resultado");
-        close(peticion[0]);
-        close(peticion[1]);
-        return false;
-    }
-
     bool reservado = false;
-    bool reserva_correcta = reservar_meeseeks(control, &reservado);
-    if (!reserva_correcta || !reservado)
+    if (!reservar_meeseeks(control, 1, &reservado))
+        return false;
+    if (!reservado)
     {
-        close(peticion[0]);
-        close(peticion[1]);
-        close(respuesta[0]);
-        close(respuesta[1]);
-        if (!reserva_correcta)
-        {
-            perror("Error al reservar un Meeseeks");
-            return false;
-        }
         resultado->estado = RESULTADO_NO_COMPLETADO;
         double restante = tiempo_disponible(control);
         if (restante < 0.0)
@@ -1210,62 +1575,44 @@ static bool crear_meeseeks(const Solicitud *solicitud, Resultado *resultado,
         return true;
     }
 
-    pid_t pid = fork();
-
-    if (pid == -1)
+    HijoMeeseeks hijo;
+    bool comunicado = iniciar_hijo(solicitud, 1, 1, -1, -1, NULL, 0, &hijo, control);
+    if (hijo.pid == 0)
     {
         perror("Error al crear el Meeseeks");
-        (void)liberar_meeseeks(control, true);
-        close(peticion[0]);
-        close(peticion[1]);
-        close(respuesta[0]);
-        close(respuesta[1]);
+        (void)liberar_meeseeks(control, 1, true);
         return false;
     }
-
-    if (pid == 0)
-    {
-        close(peticion[1]);
-        close(respuesta[0]);
-        int estado = meeseeks(peticion[0], respuesta[1], 1, 1, control);
-
-        /* El hijo termina aqui: no debe continuar con el menu de la Box. */
-        if (fflush(stdout) == EOF)
-            estado = EXIT_FAILURE;
-        _exit(estado);
-    }
-
-    resultado->pid = pid;
+    resultado->pid = hijo.pid;
     resultado->ppid = getpid();
     resultado->nivel = 1;
     resultado->instancia = 1;
-    resultado->meeseeks_creados = 1;
-
-    close(peticion[0]);
-    close(respuesta[1]);
-
-    bool comunicado = escribir_completo(peticion[1], solicitud, sizeof(*solicitud));
     if (!comunicado)
-        perror("Error al enviar la solicitud");
-    close(peticion[1]);
-
-    /* Recibe antes de waitpid: el hijo puede estar esperando espacio en el pipe. */
-    Resultado respuesta_hijo = {0};
-    if (comunicado)
     {
-        comunicado = leer_completo(respuesta[0], &respuesta_hijo, sizeof(respuesta_hijo));
-        if (!comunicado)
-            perror("Error al recibir el resultado");
+        perror("Error al enviar la solicitud");
+        /* EOF tambien cancela un subarbol si se pierde su padre. */
+        if (hijo.envio >= 0)
+            close(hijo.envio);
+        hijo.envio = -1;
     }
-    close(respuesta[0]);
 
-    /* Recoge al hijo incluso cuando falla la comunicacion. */
-    bool terminado = esperar_meeseeks(pid);
-    if (!liberar_meeseeks(control, false))
-        return false;
-    if (comunicado && terminado)
-        *resultado = respuesta_hijo;
-    return comunicado && terminado;
+    Resultado respuesta = {0};
+    bool recibido = leer_completo(hijo.recepcion, &respuesta, sizeof(respuesta));
+    if (!recibido)
+    {
+        perror("Error al recibir el resultado");
+        if (hijo.envio >= 0)
+            close(hijo.envio);
+        hijo.envio = -1;
+    }
+    close(hijo.recepcion);
+    bool terminado = esperar_meeseeks(hijo.pid);
+    if (hijo.envio >= 0)
+        close(hijo.envio);
+    bool liberado = liberar_meeseeks(control, 1, false);
+    if (recibido)
+        *resultado = respuesta;
+    return comunicado && recibido && terminado && liberado;
 }
 
 static bool procesar_solicitud(RegistroSolicitud *registro, const Configuracion *configuracion)
@@ -1325,6 +1672,10 @@ static void mostrar_resultado(const Resultado *resultado)
     else
         puts("Box: no se creo un Meeseeks para esta solicitud.");
 
+    if (resultado->estado == RESULTADO_COMPLETADO)
+        printf("Box: ganador (PID %ld, PPID %ld, N %u, i %u).\n",
+               (long)resultado->ganador.pid, (long)resultado->ganador.ppid,
+               resultado->ganador.nivel, resultado->ganador.instancia);
     printf("Box: solicitud %s.\n", nombre_estado(resultado->estado));
     printf("Box: Meeseeks creados: %u. Profundidad maxima: %u.\n",
            resultado->meeseeks_creados, resultado->profundidad_maxima);
@@ -1339,9 +1690,9 @@ static void mostrar_tiempos(const RegistroSolicitud *registro)
     {
         printf("Box: tiempo transcurrido de la solicitud: %.6f segundos.\n",
                registro->tiempo_transcurrido_segundos);
-        printf("Box: espera artificial de simulacion: %.6f segundos.\n",
+        printf("Box: espera artificial en la rama mas larga: %.6f segundos.\n",
                registro->resultado.tiempo_espera_simulada_segundos);
-        printf("Box: tiempo sin espera artificial: %.6f segundos.\n",
+        printf("Box: tiempo ajustado por pausas de la rama: %.6f segundos.\n",
                tiempo_sin_simulacion(registro));
     }
     else
@@ -1395,6 +1746,10 @@ static void mostrar_informe(const RegistroSolicitud historial[], size_t cantidad
             printf("Meeseeks inicial: (PID %ld, PPID %ld, N %u, i %u).\n",
                    (long)registro->resultado.pid, (long)registro->resultado.ppid,
                    registro->resultado.nivel, registro->resultado.instancia);
+        if (registro->resultado.estado == RESULTADO_COMPLETADO)
+            printf("Ganador: (PID %ld, PPID %ld, N %u, i %u).\n",
+                   (long)registro->resultado.ganador.pid, (long)registro->resultado.ganador.ppid,
+                   registro->resultado.ganador.nivel, registro->resultado.ganador.instancia);
         if (registro->resultado.detalle[0] != '\0')
             printf("Detalle: %s\n", registro->resultado.detalle);
         mostrar_tiempos(registro);

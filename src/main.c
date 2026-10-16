@@ -27,6 +27,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <semaphore.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -115,7 +116,6 @@ typedef struct
     bool caos_planetario;
     IdentidadMeeseeks ganador;
     double tiempo_programa_segundos;
-    double tiempo_espera_simulada_segundos;
     char detalle[MAX_TEXTO];
 } Resultado;
 
@@ -144,6 +144,7 @@ typedef struct
     Solicitud solicitud;
     Resultado resultado;
     double tiempo_transcurrido_segundos;
+    double tiempo_cpu_segundos;
 } RegistroSolicitud;
 
 static bool escribir_completo(int descriptor, const void *datos, size_t cantidad);
@@ -466,10 +467,10 @@ static double aleatorio_uniforme(void)
 
 /*
     Espera la duración simulada con poll para despertar también por cancelación.
-    El plazo limita la espera; espera_medida guarda la pausa realmente efectuada.
+    La espera termina al vencer el plazo o recibir un aviso por el pipe.
  */
 static bool esperar_simulacion(double duracion, const ControlCompartido *control,
-                              int entrada, double *espera_medida, AvisoCancelacion *aviso)
+                              int entrada, AvisoCancelacion *aviso)
 {
     struct timespec inicio;
     if (clock_gettime(CLOCK_MONOTONIC, &inicio) == -1)
@@ -529,9 +530,6 @@ static bool esperar_simulacion(double duracion, const ControlCompartido *control
             break;
         }
     }
-    if (clock_gettime(CLOCK_MONOTONIC, &ahora) == -1)
-        return false;
-    *espera_medida = diferencia_segundos(&inicio, &ahora);
     return correcto;
 }
 
@@ -551,8 +549,7 @@ static bool procesar_texto(const Solicitud *solicitud, int entrada,
                      100.0 * probabilidad, duracion);
 
     AvisoCancelacion aviso = {0};
-    if (!esperar_simulacion(duracion, control, entrada,
-                           &resultado->tiempo_espera_simulada_segundos, &aviso))
+    if (!esperar_simulacion(duracion, control, entrada, &aviso))
         return false;
     if (aviso.motivo != AVISO_NINGUNO)
     {
@@ -578,15 +575,22 @@ static bool procesar_texto(const Solicitud *solicitud, int entrada,
     return true;
 }
 
-/* Estima el tiempo sin simulación restando las pausas de la rama más larga; no es CPU. */
-static double tiempo_sin_simulacion(const RegistroSolicitud *registro)
+/*
+    Suma CPU de la Box y de sus descendientes ya recogidos: usuario y sistema.
+    Las esperas no consumen CPU; la diferencia entre dos lecturas mide una solicitud.
+ */
+static double medir_cpu_total(void)
 {
-    if (registro->tiempo_transcurrido_segundos < 0.0)
+    struct rusage propio;
+    struct rusage hijos;
+    if (getrusage(RUSAGE_SELF, &propio) == -1 || getrusage(RUSAGE_CHILDREN, &hijos) == -1)
         return -1.0;
 
-    double tiempo = registro->tiempo_transcurrido_segundos -
-                    registro->resultado.tiempo_espera_simulada_segundos;
-    return tiempo < 0.0 ? 0.0 : tiempo;
+    double segundos = (double)propio.ru_utime.tv_sec + propio.ru_stime.tv_sec +
+                      hijos.ru_utime.tv_sec + hijos.ru_stime.tv_sec;
+    double microsegundos = (double)propio.ru_utime.tv_usec + propio.ru_stime.tv_usec +
+                           hijos.ru_utime.tv_usec + hijos.ru_stime.tv_usec;
+    return segundos + microsegundos / 1000000.0;
 }
 
 /* Agrega al historial una solicitud con sus tiempos aún sin medir. */
@@ -604,6 +608,7 @@ static bool registrar_solicitud(RegistroSolicitud **historial, size_t *cantidad,
     registro->resultado.estado = RESULTADO_NO_COMPLETADO;
     registro->resultado.tiempo_programa_segundos = -1.0;
     registro->tiempo_transcurrido_segundos = -1.0;
+    registro->tiempo_cpu_segundos = -1.0;
     establecer_detalle(&registro->resultado, "Fallo al crear, comunicar o recoger el Meeseeks.");
     (*cantidad)++;
     return true;
@@ -1377,7 +1382,6 @@ static bool esperar_hijos(int entrada, HijoMeeseeks hijos[], unsigned int cantid
     bool correcto = aviso.motivo != AVISO_ERROR;
     bool vigilar_padre = true;
     unsigned int pendientes = cantidad;
-    double mayor_espera = 0.0;
     if (aviso.motivo != AVISO_NINGUNO)
     {
         if (!cancelar_hijos(hijos, cantidad, &aviso, resultado))
@@ -1415,7 +1419,6 @@ static bool esperar_hijos(int entrada, HijoMeeseeks hijos[], unsigned int cantid
                     continue;
                 Resultado respuesta = {0};
                 (void)recoger_hijo(&hijos[i], control, &respuesta, resultado);
-                mayor_espera = fmax(mayor_espera, respuesta.tiempo_espera_simulada_segundos);
             }
             break;
         }
@@ -1446,7 +1449,6 @@ static bool esperar_hijos(int entrada, HijoMeeseeks hijos[], unsigned int cantid
             Resultado respuesta = {0};
             bool recogido = recoger_hijo(&hijos[i], control, &respuesta, resultado);
             pendientes--;
-            mayor_espera = fmax(mayor_espera, respuesta.tiempo_espera_simulada_segundos);
             if (!recogido)
             {
                 correcto = false;
@@ -1473,8 +1475,6 @@ static bool esperar_hijos(int entrada, HijoMeeseeks hijos[], unsigned int cantid
         }
     }
 
-    /* Las pausas de hermanos se superponen: se conserva el mayor camino de pausas. */
-    resultado->tiempo_espera_simulada_segundos += mayor_espera;
     if (aviso.motivo == AVISO_NINGUNO)
     {
         resultado->estado = RESULTADO_NO_COMPLETADO;
@@ -1760,6 +1760,13 @@ static bool crear_meeseeks(const Solicitud *solicitud, Resultado *resultado,
 /* Prepara recursos y señales, atiende la solicitud, recoge estadísticas y mide su duración. */
 static bool procesar_solicitud(RegistroSolicitud *registro, const Configuracion *configuracion)
 {
+    double cpu_inicio = medir_cpu_total();
+    if (cpu_inicio < 0.0)
+    {
+        perror("Error al iniciar la medicion de CPU");
+        return false;
+    }
+
     struct timespec inicio;
     if (clock_gettime(CLOCK_MONOTONIC, &inicio) == -1)
     {
@@ -1822,6 +1829,13 @@ static bool procesar_solicitud(RegistroSolicitud *registro, const Configuracion 
     }
 
     registro->tiempo_transcurrido_segundos = diferencia_segundos(&inicio, &fin);
+    double cpu_fin = medir_cpu_total();
+    if (cpu_fin < 0.0)
+    {
+        perror("Error al terminar la medicion de CPU");
+        return false;
+    }
+    registro->tiempo_cpu_segundos = cpu_fin - cpu_inicio;
     return procesada;
 }
 
@@ -1846,22 +1860,18 @@ static void mostrar_resultado(const Resultado *resultado)
         printf("Box: %s\n", resultado->detalle);
 }
 
-/* Muestra las mediciones disponibles y distingue las pausas de la ejecución. */
+/* Distingue tiempo transcurrido, CPU sin esperas y duración del programa externo. */
 static void mostrar_tiempos(const RegistroSolicitud *registro)
 {
     if (registro->tiempo_transcurrido_segundos >= 0.0)
-    {
         printf("Box: tiempo transcurrido de la solicitud: %.6f segundos.\n",
                registro->tiempo_transcurrido_segundos);
-        printf("Box: espera artificial en la rama mas larga: %.6f segundos.\n",
-               registro->resultado.tiempo_espera_simulada_segundos);
-        printf("Box: tiempo ajustado por pausas de la rama: %.6f segundos.\n",
-               tiempo_sin_simulacion(registro));
-    }
     else
-    {
         puts("Box: medicion de la solicitud no disponible.");
-    }
+
+    if (registro->tiempo_cpu_segundos >= 0.0)
+        printf("Box: tiempo de CPU sin esperas (Box y descendientes): %.6f segundos.\n",
+               registro->tiempo_cpu_segundos);
 
     if (registro->resultado.tiempo_programa_segundos >= 0.0)
         printf("Box: tiempo del programa externo: %.6f segundos.\n",

@@ -124,9 +124,15 @@ resuelve siempre, siempre que termine la simulación antes del plazo. F=0 nunca
 se resuelve, ni por aging ni por un sorteo favorable.
 
 Después de esperar, el Meeseeks compara un sorteo uniforme en [0,1) con P.
-Xorshift32 usa un estado local: la Box inicializa la semilla con reloj y PID,
-y cada solicitud e hijo reciben una semilla derivada. Así los procesos creados
-con `fork()` no repiten simplemente la misma secuencia heredada.
+El generador es `rand()` de C. La Box usa `srand()` al iniciar y cada Meeseeks
+lo reinicializa con la semilla recibida por pipe antes de simular. La fórmula
+`semilla_hijo = semilla_padre * 6 + instancia` diferencia las rutas sin mezclar
+bits ni constantes hexadecimales.
+
+`MEESEEKS_SEMILLA=123 ./build/meeseeks` permite repetir los sorteos con la misma
+biblioteca de C y las mismas entradas. Sin esa variable se usa la hora actual.
+La planificación todavía puede cambiar cuántos procesos se crean y qué ganador
+se recibe primero; una semilla fija no reproduce los tiempos ni el planificador.
 
 Si falla, la ayuda se calcula con F original: 5 hijos para F<=45 y 2 para
 45<F<=85. Cada hijo recibe la misma solicitud por su pipe privado, con nivel
@@ -181,6 +187,7 @@ Los límites se configuran mediante variables de entorno:
 | `MEESEEKS_PLAZO_SEGUNDOS` | 300 segundos (5 minutos) | Positivo, hasta 86400. |
 | `MEESEEKS_EXPERIMENTAL` | 0 | 0 normal, 1 experimental. |
 | `MEESEEKS_LIMITE_EXTRAORDINARIO` | Sin definir | Obligatorio solo en modo experimental, mayor que el plazo normal y hasta 86400 s. |
+| `MEESEEKS_SEMILLA` | Hora actual | Entero positivo hasta `UINT_MAX`; opcional para repetir sorteos. |
 
 El plazo comienza antes de preparar los recursos y crear al primer Meeseeks;
 incluye la espera simulada. En modo normal se aplica el plazo normal. El modo

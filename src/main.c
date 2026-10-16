@@ -23,7 +23,6 @@
 #include <signal.h>
 #include <stdarg.h>
 #include <poll.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -63,7 +62,7 @@ typedef struct
     bool facilidad_aleatoria;
     bool tiempo_aleatorio;
     double tiempo_segundos;
-    uint32_t semilla;
+    unsigned int semilla;
 } Solicitud;
 
 typedef enum
@@ -126,7 +125,7 @@ typedef struct
     double plazo_segundos;
     bool modo_experimental;
     double limite_extraordinario;
-    uint32_t semilla;
+    unsigned int semilla;
 } Configuracion;
 
 /* Solo los contadores se comparten; las solicitudes siguen viajando por pipes. */
@@ -334,11 +333,11 @@ static bool cargar_configuracion(Configuracion *configuracion)
         return false;
     }
 
-    struct timespec ahora;
-    if (clock_gettime(CLOCK_MONOTONIC, &ahora) == -1)
+    double semilla = (double)time(NULL);
+    if (!leer_variable_positiva("MEESEEKS_SEMILLA", UINT_MAX, &semilla) ||
+        semilla <= 0.0 || floor(semilla) != semilla)
         return false;
-    configuracion->semilla = (uint32_t)ahora.tv_nsec ^ (uint32_t)ahora.tv_sec ^
-                            ((uint32_t)getpid() * 2654435761u);
+    configuracion->semilla = (unsigned int)semilla;
     return true;
 }
 
@@ -454,27 +453,15 @@ static unsigned int ayuda_necesaria(double facilidad)
 }
 
 /* Obtiene la semilla de cada solicitud o hijo a partir de su padre e instancia. */
-static uint32_t derivar_semilla(uint32_t base, uint32_t instancia)
+static unsigned int derivar_semilla(unsigned int base, unsigned int instancia)
 {
-    uint32_t valor = base ^ (instancia * 0x9e3779b9u);
-    valor ^= valor >> 16;
-    valor *= 0x85ebca6bu;
-    valor ^= valor >> 13;
-    valor *= 0xc2b2ae35u;
-    valor ^= valor >> 16;
-    return valor;
+    return base * (MAX_HIJOS + 1u) + instancia;
 }
 
-/* Genera un valor uniforme en [0, 1) y actualiza el estado aleatorio. */
-static double aleatorio_uniforme(uint32_t *semilla)
+/* Usa rand de C para obtener un valor uniforme en [0, 1). */
+static double aleatorio_uniforme(void)
 {
-    /* Xorshift32: secuencia definida en C, independiente del PID y de libc. */
-    uint32_t valor = *semilla == 0 ? 0x6d2b79f5u : *semilla;
-    valor ^= valor << 13;
-    valor ^= valor >> 17;
-    valor ^= valor << 5;
-    *semilla = valor;
-    return (double)valor / 4294967296.0;
+    return (double)rand() / ((double)RAND_MAX + 1.0);
 }
 
 /*
@@ -555,9 +542,9 @@ static bool esperar_simulacion(double duracion, const ControlCompartido *control
 static bool procesar_texto(const Solicitud *solicitud, int entrada,
                           ControlCompartido *control, Resultado *resultado)
 {
-    uint32_t semilla = solicitud->semilla;
+    srand(solicitud->semilla);
     double duracion = solicitud->tiempo_aleatorio ?
-                      0.5 + 4.5 * aleatorio_uniforme(&semilla) : solicitud->tiempo_segundos;
+                      0.5 + 4.5 * aleatorio_uniforme() : solicitud->tiempo_segundos;
     double probabilidad = probabilidad_resolver(solicitud->facilidad, resultado->nivel);
     mensaje_meeseeks(resultado, "facilidad efectiva %.9g, probabilidad %.9g%%, simulacion %.4f segundos.",
                      facilidad_por_generacion(solicitud->facilidad, resultado->nivel),
@@ -574,7 +561,7 @@ static bool procesar_texto(const Solicitud *solicitud, int entrada,
         return aviso.motivo != AVISO_ERROR;
     }
 
-    if (solicitud->facilidad > 0.0 && aleatorio_uniforme(&semilla) < probabilidad)
+    if (solicitud->facilidad > 0.0 && aleatorio_uniforme() < probabilidad)
     {
         resultado->estado = RESULTADO_COMPLETADO;
         resultado->ganador = (IdentidadMeeseeks){resultado->pid, resultado->ppid,
@@ -735,7 +722,7 @@ static bool leer_numero_en_rango(const char *mensaje, const char *error, double 
 }
 
 /* Configura facilidad y duración; false indica cancelación, fin de entrada o error. */
-static bool capturar_datos_textuales(Solicitud *solicitud, uint32_t *semilla)
+static bool capturar_datos_textuales(Solicitud *solicitud)
 {
     puts("\n--- CONFIGURACION DE TAREA TEXTUAL ---");
     puts("Facilidad: 0 = imposible, 100 = muy facil.");
@@ -748,7 +735,7 @@ static bool capturar_datos_textuales(Solicitud *solicitud, uint32_t *semilla)
         return false;
     solicitud->facilidad_aleatoria = opcion == 2;
     if (solicitud->facilidad_aleatoria)
-        solicitud->facilidad = 100.0 * aleatorio_uniforme(semilla);
+        solicitud->facilidad = 100.0 * aleatorio_uniforme();
     else if (!leer_numero_en_rango("Facilidad (0 a 100): ",
                                   "La facilidad debe estar entre 0 y 100.",
                                   100.0, true, &solicitud->facilidad))
@@ -1929,7 +1916,7 @@ static int box(void)
         return EXIT_FAILURE;
     }
 
-    uint32_t semilla_captura = configuracion.semilla;
+    srand(configuracion.semilla);
     printf("Box: modo %s; limite efectivo %.3f segundos.\n",
            configuracion.modo_experimental ? "experimental" : "normal",
            plazo_efectivo(&configuracion));
@@ -1969,7 +1956,7 @@ static int box(void)
         strcpy(solicitud.contenido, texto);
 
         if (solicitud.tipo == TIPO_TEXTO &&
-            !capturar_datos_textuales(&solicitud, &semilla_captura))
+            !capturar_datos_textuales(&solicitud))
         {
             if (feof(stdin) || ferror(stdin))
                 break;
@@ -1978,7 +1965,7 @@ static int box(void)
             continue;
         }
 
-        solicitud.semilla = derivar_semilla(configuracion.semilla, (uint32_t)(total_solicitudes + 1));
+        solicitud.semilla = derivar_semilla(configuracion.semilla, (unsigned int)(total_solicitudes + 1));
         if (!registrar_solicitud(&historial, &total_solicitudes, &solicitud))
         {
             perror("Error al reservar el registro de la solicitud");

@@ -158,6 +158,10 @@ static bool leer_completo(int descriptor, void *datos, size_t cantidad);
 static int meeseeks(int entrada, int salida, unsigned int nivel, unsigned int instancia,
                     ControlCompartido *control);
 
+/*
+    Escribe una línea en la terminal con una tabulación por cada nivel anterior.
+    La sangría permite reconocer la jerarquía de procesos en los mensajes.
+ */
 static void imprimir_linea(unsigned int nivel, const char *texto)
 {
     char linea[1024];
@@ -170,6 +174,10 @@ static void imprimir_linea(unsigned int nivel, const char *texto)
         (void)escribir_completo(STDOUT_FILENO, linea, sangria + (size_t)longitud);
 }
 
+/*
+    Construye un mensaje con formato, agrega el PID y PPID del Meeseeks
+    que lo produce y lo muestra con la sangría correspondiente a su nivel.
+ */
 static void mensaje_meeseeks(const Resultado *resultado, const char *formato, ...)
 {
     char mensaje[640];
@@ -184,6 +192,10 @@ static void mensaje_meeseeks(const Resultado *resultado, const char *formato, ..
     imprimir_linea(resultado->nivel, texto);
 }
 
+/*
+    Actualiza el resultado local según el aviso de cancelación recibido.
+    Registra si hubo ganador en otra rama, caos planetario, interrupción o error.
+ */
 static void aplicar_cancelacion(Resultado *resultado, const AvisoCancelacion *aviso)
 {
     resultado->estado = RESULTADO_NO_COMPLETADO;
@@ -204,6 +216,10 @@ static void aplicar_cancelacion(Resultado *resultado, const AvisoCancelacion *av
                  "Cancelacion por error o cierre del pipe del padre.");
 }
 
+/*
+    Lee un aviso completo desde el pipe del padre y valida su motivo.
+    Si el mensaje está incompleto o es inválido, devuelve false y señala un error.
+ */
 static bool recibir_aviso(int entrada, AvisoCancelacion *aviso)
 {
     if (!leer_completo(entrada, aviso, sizeof(*aviso)))
@@ -220,6 +236,9 @@ static bool recibir_aviso(int entrada, AvisoCancelacion *aviso)
     return true;
 }
 
+/*
+    Devuelve el nombre del tipo de solicitud para mostrarlo en la terminal.
+ */
 static const char *nombre_tipo(TipoSolicitud tipo)
 {
     switch (tipo)
@@ -235,6 +254,9 @@ static const char *nombre_tipo(TipoSolicitud tipo)
     }
 }
 
+/*
+    Devuelve el texto que representa el estado de una solicitud en el informe.
+ */
 static const char *nombre_estado(EstadoResultado estado)
 {
     switch (estado)
@@ -250,18 +272,30 @@ static const char *nombre_estado(EstadoResultado estado)
     }
 }
 
+/*
+    Calcula los segundos transcurridos entre dos mediciones de tipo timespec,
+    incluyendo la fracción de segundo almacenada en los nanosegundos.
+ */
 static double diferencia_segundos(const struct timespec *inicio, const struct timespec *fin)
 {
     return (double)(fin->tv_sec - inicio->tv_sec) +
            (double)(fin->tv_nsec - inicio->tv_nsec) / 1000000000.0;
 }
 
+/*
+    Devuelve el plazo normal o el límite extraordinario cuando está activo
+    el modo experimental. Este valor determina cuándo cancelar la solicitud.
+ */
 static double plazo_efectivo(const Configuracion *configuracion)
 {
     return configuracion->modo_experimental ? configuracion->limite_extraordinario :
                                              configuracion->plazo_segundos;
 }
 
+/*
+    Lee una variable de entorno y comprueba que contenga un número finito,
+    positivo y dentro del máximo permitido. Si no existe, conserva el valor recibido.
+ */
 static bool leer_variable_positiva(const char *nombre, double maximo, double *valor)
 {
     const char *texto = getenv(nombre);
@@ -280,6 +314,11 @@ static bool leer_variable_positiva(const char *nombre, double maximo, double *va
     return true;
 }
 
+/*
+    Carga los límites y la semilla desde las variables de entorno, usando los
+    valores predeterminados cuando corresponde. Valida el presupuesto de procesos
+    y exige un límite extraordinario explícito para activar el modo experimental.
+ */
 static bool cargar_configuracion(Configuracion *configuracion)
 {
     *configuracion = (Configuracion){.max_procesos = PROCESOS_PREDETERMINADOS,
@@ -347,6 +386,10 @@ static bool cargar_configuracion(Configuracion *configuracion)
     return true;
 }
 
+/*
+    Adquiere el semáforo de los contadores compartidos y reintenta si sem_wait
+    se interrumpe por una señal. Quien lo adquiere debe liberarlo con sem_post.
+ */
 static bool bloquear_control(ControlCompartido *control)
 {
     int estado;
@@ -357,6 +400,11 @@ static bool bloquear_control(ControlCompartido *control)
     return estado == 0;
 }
 
+/*
+    Reserva con mmap la memoria compartida para los contadores, límites y tiempo
+    inicial. Inicializa un semáforo compartido entre procesos y devuelve NULL
+    si no se pueden preparar estos recursos.
+ */
 static ControlCompartido *crear_control(const Configuracion *configuracion,
                                        const struct timespec *inicio)
 {
@@ -387,6 +435,10 @@ static ControlCompartido *crear_control(const Configuracion *configuracion,
     return control;
 }
 
+/*
+    Calcula con CLOCK_MONOTONIC cuánto tiempo queda antes del límite efectivo.
+    Devuelve cero si el plazo terminó o -1 si no se pudo consultar el reloj.
+ */
 static double tiempo_disponible(const ControlCompartido *control)
 {
     struct timespec ahora;
@@ -397,6 +449,11 @@ static double tiempo_disponible(const ControlCompartido *control)
     return fmax(0.0, restante);
 }
 
+/*
+    Reserva bajo el semáforo el grupo completo de procesos antes de crear hijos.
+    El parámetro reservado indica si alcanzan el presupuesto y el tiempo;
+    el valor de retorno indica si la consulta y la sincronización fueron correctas.
+ */
 static bool reservar_meeseeks(ControlCompartido *control, unsigned int cantidad, bool *reservado)
 {
     double restante = tiempo_disponible(control);
@@ -413,6 +470,11 @@ static bool reservar_meeseeks(ControlCompartido *control, unsigned int cantidad,
     return sem_post(&control->mutex) == 0;
 }
 
+/*
+    Actualiza los contadores bajo el semáforo al recoger procesos o deshacer
+    reservas que no llegaron a crearse. Una recolección reduce los activos,
+    pero conserva el total creado para no reutilizar el presupuesto de la solicitud.
+ */
 static bool liberar_meeseeks(ControlCompartido *control, unsigned int cantidad, bool fallo_fork)
 {
     if (!bloquear_control(control))
@@ -425,6 +487,11 @@ static bool liberar_meeseeks(ControlCompartido *control, unsigned int cantidad, 
     return sem_post(&control->mutex) == 0;
 }
 
+/*
+    Aumenta la facilidad efectiva con el nivel mediante la fórmula
+    100 - (100 - facilidad) * 0.8^(nivel - 1), como un mecanismo de aging.
+    La facilidad cero se conserva para que una tarea imposible nunca se simplifique.
+ */
 static double facilidad_por_generacion(double facilidad, unsigned int nivel)
 {
     if (facilidad == 0.0 || nivel == 1)
@@ -432,17 +499,31 @@ static double facilidad_por_generacion(double facilidad, unsigned int nivel)
     return 100.0 - (100.0 - facilidad) * pow(0.8, (double)(nivel - 1));
 }
 
+/*
+    Calcula la probabilidad de éxito como (facilidad efectiva / 100)^2.
+    La curva exige más ayuda para las tareas difíciles; cuando la facilidad
+    efectiva supera 85, la probabilidad es 1 y el Meeseeks resuelve sin hijos.
+ */
 static double probabilidad_resolver(double facilidad, unsigned int nivel)
 {
     double efectiva = facilidad_por_generacion(facilidad, nivel);
     return efectiva > 85.0 ? 1.0 : pow(efectiva / 100.0, 2.0);
 }
 
+/*
+    Determina la cantidad mínima de hijos según la facilidad original:
+    cinco hasta 45, dos para valores mayores que 45 y hasta 85, y cero sobre 85.
+ */
 static unsigned int ayuda_necesaria(double facilidad)
 {
     return facilidad > 85.0 ? 0 : (facilidad <= 45.0 ? 5 : 2);
 }
 
+/*
+    Mezcla una semilla base con el número de instancia para generar la semilla
+    de una solicitud o un hijo. Así los hijos no repiten simplemente el estado
+    heredado por fork y sus secuencias no dependen del PID.
+ */
 static uint32_t derivar_semilla(uint32_t base, uint32_t instancia)
 {
     uint32_t valor = base ^ (instancia * 0x9e3779b9u);
@@ -454,6 +535,10 @@ static uint32_t derivar_semilla(uint32_t base, uint32_t instancia)
     return valor;
 }
 
+/*
+    Genera un valor pseudoaleatorio uniforme entre 0 incluido y 1 excluido
+    mediante Xorshift32, actualizando la semilla recibida por referencia.
+ */
 static double aleatorio_uniforme(uint32_t *semilla)
 {
     /* Xorshift32: secuencia definida en C, independiente del PID y de libc. */
@@ -465,6 +550,11 @@ static double aleatorio_uniforme(uint32_t *semilla)
     return (double)valor / 4294967296.0;
 }
 
+/*
+    Realiza la pausa artificial mediante poll para poder recibir cancelaciones
+    por el pipe del padre y respetar el plazo. Mide la espera efectuada incluso
+    si termina antes de la duración solicitada y comunica el motivo mediante aviso.
+ */
 static bool esperar_simulacion(double duracion, const ControlCompartido *control,
                               int entrada, double *espera_medida, AvisoCancelacion *aviso)
 {
@@ -532,6 +622,11 @@ static bool esperar_simulacion(double duracion, const ControlCompartido *control
     return correcto;
 }
 
+/*
+    Simula el intento de un Meeseeks: elige la duración, espera y evalúa la
+    probabilidad según su generación. Registra al ganador si resuelve o deja
+    la tarea pendiente para solicitar ayuda; una facilidad cero nunca tiene éxito.
+ */
 static bool procesar_texto(const Solicitud *solicitud, int entrada,
                           ControlCompartido *control, Resultado *resultado)
 {
@@ -572,6 +667,11 @@ static bool procesar_texto(const Solicitud *solicitud, int entrada,
     return true;
 }
 
+/*
+    Resta del tiempo transcurrido las pausas acumuladas de la rama con mayor
+    espera y limita el resultado a cero. Es un tiempo ajustado, no tiempo de CPU;
+    devuelve -1 si no existe una medición del tiempo transcurrido.
+ */
 static double tiempo_sin_simulacion(const RegistroSolicitud *registro)
 {
     if (registro->tiempo_transcurrido_segundos < 0.0)
@@ -582,6 +682,11 @@ static double tiempo_sin_simulacion(const RegistroSolicitud *registro)
     return tiempo < 0.0 ? 0.0 : tiempo;
 }
 
+/*
+    Amplía el historial con realloc y agrega una copia de la solicitud.
+    Inicializa su registro para conservar el resultado y los tiempos posteriores;
+    si no se puede reservar memoria, devuelve false sin agregar la solicitud.
+ */
 static bool registrar_solicitud(RegistroSolicitud **historial, size_t *cantidad,
                                const Solicitud *solicitud)
 {
@@ -608,6 +713,10 @@ static bool registrar_solicitud(RegistroSolicitud **historial, size_t *cantidad,
     return true;
 }
 
+/*
+    Elimina los espacios en blanco del inicio y del final del texto,
+    modificando la misma cadena y conservando los espacios internos.
+ */
 static void limpiar_espacios(char *texto) 
 {
     char *inicio = texto;
@@ -625,6 +734,11 @@ static void limpiar_espacios(char *texto)
     }
 }
 
+/*
+    Lee el contenido con getline, elimina espacios de los extremos y comprueba
+    que no esté vacío ni supere MAX_TEXTO - 1 caracteres. Devuelve false ante
+    una entrada inválida, fin de entrada o error de lectura.
+ */
 static bool leer_solicitud(char **texto, size_t *capacidad) 
 {
     printf("\nSolicitud: ");
@@ -643,6 +757,11 @@ static bool leer_solicitud(char **texto, size_t *capacidad)
     return true;
 }
 
+/*
+    Solicita un número decimal y lo convierte con strtod, rechazando texto
+    sobrante, valores no finitos o fuera de rango. Repite las entradas inválidas
+    y devuelve false si termina la entrada o falla la lectura.
+ */
 static bool leer_numero(const char *mensaje, double *numero)
 {
     char *entrada = NULL;
@@ -677,7 +796,11 @@ static bool leer_numero(const char *mensaje, double *numero)
     }
 }
 
-/* El menu valida las opciones permitidas; aqui solo se exige un entero. */
+/*
+    Reutiliza leer_numero para obtener una opción entera no negativa.
+    Devuelve -1 si el valor no es un entero válido y -2 si no se pudo leer;
+    cada menú comprueba después cuáles opciones permite.
+ */
 static int leer_opcion(void)
 {
     double numero;
@@ -692,6 +815,11 @@ static int leer_opcion(void)
     return (int)numero;
 }
 
+/*
+    Configura la facilidad y la duración de una tarea textual, con opción manual
+    o aleatoria. La facilidad aleatoria se obtiene aquí; la duración aleatoria
+    se genera en cada Meeseeks. Devuelve false al cancelar o terminar la entrada.
+ */
 static bool capturar_datos_textuales(Solicitud *solicitud, uint32_t *semilla)
 {
     puts("\n--- CONFIGURACION DE TAREA TEXTUAL ---");
@@ -783,6 +911,10 @@ static bool capturar_datos_textuales(Solicitud *solicitud, uint32_t *semilla)
 }
 
 
+/*
+    Muestra el número, contenido y tipo de la solicitud antes de procesarla.
+    Para las tareas textuales incluye la facilidad y la modalidad de duración.
+ */
 static void mostrar_solicitud(const Solicitud *solicitud, size_t numero)
 {
     printf("Box: solicitud #%zu recibida: \"%s\"\n",
@@ -809,6 +941,11 @@ static void mostrar_solicitud(const Solicitud *solicitud, size_t numero)
     puts("Box: pendiente de procesar.");
 }
 
+/*
+    Envía todos los bytes solicitados por un descriptor, repitiendo las
+    escrituras parciales y las interrumpidas por señales. Devuelve false
+    si ocurre un error o la escritura no puede avanzar.
+ */
 static bool escribir_completo(int descriptor, const void *datos, size_t cantidad)
 {
     const char *bytes = datos;
@@ -837,6 +974,11 @@ static bool escribir_completo(int descriptor, const void *datos, size_t cantidad
     return true;
 }
 
+/*
+    Recibe la cantidad exacta de bytes de un mensaje, repitiendo las lecturas
+    parciales y las interrumpidas por señales. Si el emisor cierra antes de
+    completar el mensaje, devuelve false y establece errno en EPIPE.
+ */
 static bool leer_completo(int descriptor, void *datos, size_t cantidad)
 {
     char *bytes = datos;
@@ -866,6 +1008,11 @@ static bool leer_completo(int descriptor, void *datos, size_t cantidad)
     return true;
 }
 
+/*
+    Evalúa una expresión numérica, aritmética o lógica mediante TinyExpr,
+    sin admitir funciones ni variables. Guarda el resultado o describe errores
+    de sintaxis, memoria, división por cero, dominio o rango numérico.
+ */
 static void procesar_calculo(const char *expresion, Resultado *resultado)
 {
     resultado->estado = RESULTADO_NO_COMPLETADO;
@@ -939,6 +1086,10 @@ static void procesar_calculo(const char *expresion, Resultado *resultado)
     }
 }
 
+/*
+    Espera y recoge al hijo indicado con waitpid, reintentando si una señal
+    interrumpe la espera. Guarda su estado de terminación en el parámetro estado.
+ */
 static bool esperar_proceso(pid_t pid, int *estado)
 {
     pid_t esperado;
@@ -951,6 +1102,11 @@ static bool esperar_proceso(pid_t pid, int *estado)
     return esperado != -1;
 }
 
+/*
+    Envía SIGTERM al programa externo y a su grupo de procesos; tras una pausa
+    de gracia envía SIGKILL para detener los que continúen. Finalmente recoge
+    al hijo directo mediante waitpid y guarda su estado de terminación.
+ */
 static bool terminar_programa(pid_t pid, int *estado)
 {
     /* El grupo incluye los hijos normales del programa; el Meeseeks queda fuera. */
@@ -965,6 +1121,11 @@ static bool terminar_programa(pid_t pid, int *estado)
     return esperar_proceso(pid, estado);
 }
 
+/*
+    Supervisa la terminación del programa con waitpid sin bloqueo y consulta
+    el pipe del padre con poll. Si vence el plazo o llega una cancelación,
+    ordena terminar el programa y recogerlo antes de devolver el control.
+ */
 static bool esperar_programa_limitado(pid_t pid, int *estado, int entrada,
                                      const ControlCompartido *control, AvisoCancelacion *aviso)
 {
@@ -1009,6 +1170,11 @@ static bool esperar_programa_limitado(pid_t pid, int *estado, int entrada,
     }
 }
 
+/*
+    Divide el comando en el arreglo de argumentos que necesita execvp,
+    modificando la cadena original y respetando comillas y escapes.
+    Rechaza argumentos excesivos, comillas abiertas y operadores de shell sin comillas.
+ */
 static bool separar_argumentos(char *comando, char *argumentos[], size_t capacidad,
                               Resultado *resultado)
 {
@@ -1089,6 +1255,11 @@ static bool separar_argumentos(char *comando, char *argumentos[], size_t capacid
     return true;
 }
 
+/*
+    Lee del pipe de errores el errno enviado si falla el lanzamiento del programa.
+    Un cierre sin datos indica que no se recibió un error de lanzamiento;
+    este canal permite distinguir dicho fallo de un programa que retorna 127.
+ */
 static bool leer_error_ejecucion(int descriptor, int *error_ejecucion)
 {
     ssize_t leidos;
@@ -1110,6 +1281,12 @@ static bool leer_error_ejecucion(int descriptor, int *error_ejecucion)
                          sizeof(*error_ejecucion) - (size_t)leidos);
 }
 
+/*
+    Prepara al hijo que ejecutará el programa: cierra canales del Meeseeks,
+    crea su grupo, conecta la entrada a /dev/null y restaura las señales necesarias.
+    Llama a execvp; si la preparación o ejecución falla, envía errno por pipe
+    y termina con _exit(127). Esta función no regresa al código del Meeseeks.
+ */
 static void ejecutar_programa_hijo(char *const argumentos[], int errores, int respuesta, int cancelaciones)
 {
     close(respuesta);
@@ -1151,6 +1328,11 @@ static void ejecutar_programa_hijo(char *const argumentos[], int errores, int re
     _exit(127);
 }
 
+/*
+    Prepara los argumentos y crea un hijo para ejecutar el programa externo.
+    Controla su espera y mide el tiempo con CLOCK_MONOTONIC; registra por separado
+    el fallo de lanzamiento, la salida correcta, el código de error o una señal.
+ */
 static void procesar_programa(const char *contenido, int respuesta, int entrada,
                               ControlCompartido *control, Resultado *resultado)
 {
@@ -1269,6 +1451,12 @@ static void procesar_programa(const char *contenido, int respuesta, int entrada,
                  "El programa termino con un estado inesperado.");
 }
 
+/*
+    Crea los pipes privados de petición y respuesta y un Meeseeks mediante fork.
+    El hijo cierra los canales heredados que no usa y el padre envía la Solicitud.
+    La reserva de presupuesto debe existir previamente; si falla el envío después
+    de fork, el llamador aún debe recoger al hijo cuyo PID quedó registrado.
+ */
 static bool iniciar_hijo(const Solicitud *solicitud, unsigned int nivel, unsigned int instancia,
                          int entrada_padre, int salida_padre, HijoMeeseeks hermanos[],
                          unsigned int cantidad_hermanos, HijoMeeseeks *hijo,
@@ -1337,6 +1525,11 @@ static bool iniciar_hijo(const Solicitud *solicitud, unsigned int nivel, unsigne
     return true;
 }
 
+/*
+    Envía por los pipes privados un aviso de resolución o cancelación a los
+    hijos que conservan un canal abierto. Cada hijo debe propagarlo a su subárbol;
+    un EPIPE indica que el lector del hijo ya se cerró y se descarta ese canal.
+ */
 static bool avisar_hijos(HijoMeeseeks hijos[], unsigned int cantidad,
                         const AvisoCancelacion *aviso, const Resultado *padre)
 {
@@ -1364,6 +1557,11 @@ static bool avisar_hijos(HijoMeeseeks hijos[], unsigned int cantidad,
     return correcto;
 }
 
+/*
+    Recibe el resultado estructurado de un hijo, cierra sus canales y lo recoge
+    con waitpid. Actualiza los contadores compartidos y comprueba tanto la
+    recepción completa como la terminación correcta del proceso.
+ */
 static bool recoger_hijo(HijoMeeseeks *hijo, ControlCompartido *control,
                          Resultado *respuesta, const Resultado *padre)
 {
@@ -1387,7 +1585,12 @@ static bool recoger_hijo(HijoMeeseeks *hijo, ControlCompartido *control,
     return recibido && recogido && liberado && WIFEXITED(estado) && WEXITSTATUS(estado) == EXIT_SUCCESS;
 }
 
-/* Cada padre supervisa solo sus hijos directos; cada hijo hace lo mismo con su subarbol. */
+/*
+    Supervisa con poll los resultados de los hijos directos y los avisos del padre.
+    Al recibir una solución conserva al ganador y avisa a los hermanos para cancelar
+    sus subárboles. Recoge a todos sus hijos antes de regresar y acumula la mayor
+    espera entre ramas hermanas, cuyas pausas pueden superponerse.
+ */
 static bool esperar_hijos(int entrada, HijoMeeseeks hijos[], unsigned int cantidad,
                           ControlCompartido *control, Resultado *resultado,
                           AvisoCancelacion aviso)
@@ -1510,6 +1713,12 @@ static bool esperar_hijos(int entrada, HijoMeeseeks hijos[], unsigned int cantid
     return correcto;
 }
 
+/*
+    Reserva el grupo mínimo de hijos según la facilidad y crea la siguiente
+    generación con semillas e instancias propias. Si faltan recursos o tiempo,
+    registra el motivo; ante un fallo parcial libera las reservas no usadas
+    y coordina la cancelación y recolección de los hijos que sí se crearon.
+ */
 static bool solicitar_ayuda(const Solicitud *solicitud, int entrada, int salida,
                            ControlCompartido *control, Resultado *resultado)
 {
@@ -1564,7 +1773,12 @@ static bool solicitar_ayuda(const Solicitud *solicitud, int entrada, int salida,
     return esperar_hijos(entrada, hijos, creados, control, resultado, aviso) && correcto;
 }
 
-/* Recibe su solicitud privada y devuelve el resultado a su padre. */
+/*
+    Controla la vida de un Meeseeks: registra su identidad y nivel, recibe su
+    Solicitud privada y atiende el caso textual, cálculo o programa externo.
+    Si necesita ayuda, coordina su subárbol. Después de recoger a sus descendientes,
+    envía el resultado a su padre por pipe, cierra los canales y se despide.
+ */
 static int meeseeks(int entrada, int salida, unsigned int nivel, unsigned int instancia,
                     ControlCompartido *control)
 {
@@ -1632,6 +1846,11 @@ static int meeseeks(int entrada, int salida, unsigned int nivel, unsigned int in
     return correcto && enviado ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
+/*
+    Permite a la Box recoger al Meeseeks inicial y verificar cómo terminó.
+    El parámetro recogido distingue una recolección realizada de una espera
+    fallida, aunque el hijo haya terminado por señal o con un código de error.
+ */
 static bool esperar_meeseeks(pid_t pid, bool *recogido)
 {
     int estado;
@@ -1659,6 +1878,11 @@ static bool esperar_meeseeks(pid_t pid, bool *recogido)
     return true;
 }
 
+/*
+    Consulta sin bloquear si hay un SIGINT o SIGTERM pendiente en la Box.
+    Devuelve la señal recibida, cero si no hay ninguna o -1 ante otro error;
+    estas señales deben estar bloqueadas previamente para usar sigtimedwait.
+ */
 static int consultar_interrupcion(void)
 {
     sigset_t senales;
@@ -1672,6 +1896,11 @@ static int consultar_interrupcion(void)
     return signo;
 }
 
+/*
+    Espera en la Box el resultado del Meeseeks inicial mientras vigila el plazo
+    y las interrupciones. Envía la cancelación por pipe cuando corresponde y,
+    en modo experimental, informa al superar el plazo normal.
+ */
 static bool recibir_resultado_raiz(HijoMeeseeks *hijo, Resultado *resultado,
                                   const ControlCompartido *control)
 {
@@ -1718,7 +1947,11 @@ static bool recibir_resultado_raiz(HijoMeeseeks *hijo, Resultado *resultado,
     }
 }
 
-/* La Box usa los mismos canales privados que los padres del arbol. */
+/*
+    Reserva y crea al Meeseeks inicial con nivel e instancia iguales a uno.
+    Usa los mismos canales privados que el resto del árbol para enviar la solicitud
+    y recibir el resultado; luego espera al hijo y actualiza los contadores.
+ */
 static bool crear_meeseeks(const Solicitud *solicitud, Resultado *resultado,
                            ControlCompartido *control)
 {
@@ -1785,6 +2018,11 @@ static bool crear_meeseeks(const Solicitud *solicitud, Resultado *resultado,
     return comunicado && recibido && terminado && liberado;
 }
 
+/*
+    Coordina una solicitud desde la Box y mide su tiempo con CLOCK_MONOTONIC.
+    Prepara memoria compartida, semáforo y manejo de interrupciones; al terminar
+    la atención recoge las estadísticas, verifica los contadores y libera los recursos.
+ */
 static bool procesar_solicitud(RegistroSolicitud *registro, const Configuracion *configuracion)
 {
     registro->configuracion = *configuracion;
@@ -1856,6 +2094,10 @@ static bool procesar_solicitud(RegistroSolicitud *registro, const Configuracion 
     return procesada;
 }
 
+/*
+    Muestra los límites y semillas usados en una solicitud, junto con el modo
+    de ejecución y la indicación de si su duración superó el plazo normal.
+ */
 static void mostrar_configuracion_registro(const RegistroSolicitud *registro)
 {
     const Configuracion *configuracion = &registro->configuracion;
@@ -1867,6 +2109,10 @@ static void mostrar_configuracion_registro(const RegistroSolicitud *registro)
            registro->tiempo_transcurrido_segundos > configuracion->plazo_segundos ? "si" : "no");
 }
 
+/*
+    Presenta el estado y detalle de la solicitud, la identidad del Meeseeks inicial
+    y del ganador cuando existe, además de los contadores y la profundidad alcanzada.
+ */
 static void mostrar_resultado(const Resultado *resultado)
 {
     if (resultado->pid > 0)
@@ -1889,6 +2135,10 @@ static void mostrar_resultado(const Resultado *resultado)
         printf("Box: %s\n", resultado->detalle);
 }
 
+/*
+    Muestra el tiempo transcurrido, las pausas de la rama más larga y el tiempo
+    ajustado al descontarlas. Incluye el tiempo del programa externo si está disponible.
+ */
 static void mostrar_tiempos(const RegistroSolicitud *registro)
 {
     if (registro->tiempo_transcurrido_segundos >= 0.0)
@@ -1910,6 +2160,11 @@ static void mostrar_tiempos(const RegistroSolicitud *registro)
                registro->resultado.tiempo_programa_segundos);
 }
 
+/*
+    Resume el historial al salir de la Box: cuenta solicitudes por estado y motivo
+    de finalización, y presenta por solicitud su configuración, procesos, ganador
+    y tiempos medidos durante la ejecución.
+ */
 static void mostrar_informe(const RegistroSolicitud historial[], size_t cantidad)
 {
     size_t completadas = 0;
@@ -1974,6 +2229,11 @@ static void mostrar_informe(const RegistroSolicitud historial[], size_t cantidad
     }
 }
 
+/*
+    Controla el menú y la atención consecutiva de solicitudes: carga la configuración,
+    captura y valida las entradas, registra cada solicitud y delega su procesamiento.
+    Al finalizar muestra el informe y libera la memoria del historial y de lectura.
+ */
 static int box(void)
 {
     char *texto = NULL;
@@ -2097,6 +2357,10 @@ static int box(void)
 
 }
 
+/*
+    Muestra el título del programa y delega el control a box, devolviendo
+    su código de salida al sistema operativo.
+ */
 int main(void)
 {
     printf("=== Box de Mr. Meeseeks === \n");

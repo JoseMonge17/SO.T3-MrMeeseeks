@@ -63,6 +63,7 @@ typedef struct
     bool facilidad_aleatoria;
     bool tiempo_aleatorio;
     double tiempo_segundos;
+    uint32_t semilla;
 } Solicitud;
 
 typedef enum
@@ -85,7 +86,8 @@ typedef enum
     AVISO_NINGUNO,
     AVISO_RESUELTO,
     AVISO_PLAZO,
-    AVISO_ERROR
+    AVISO_ERROR,
+    AVISO_INTERRUPCION
 } MotivoAviso;
 
 typedef struct
@@ -112,6 +114,10 @@ typedef struct
     unsigned int meeseeks_creados;
     unsigned int profundidad_maxima;
     bool caos_planetario;
+    bool presupuesto_agotado;
+    bool interrumpida;
+    unsigned int meeseeks_recogidos;
+    unsigned int activos_al_final;
     IdentidadMeeseeks ganador;
     double tiempo_programa_segundos;
     double tiempo_espera_simulada_segundos;
@@ -122,6 +128,9 @@ typedef struct
 {
     unsigned int max_procesos;
     double plazo_segundos;
+    bool modo_experimental;
+    double limite_extraordinario;
+    uint32_t semilla;
 } Configuracion;
 
 /* Solo los contadores se comparten; las solicitudes siguen viajando por pipes. */
@@ -130,6 +139,7 @@ typedef struct
     sem_t mutex;
     unsigned int creados;
     unsigned int activos;
+    unsigned int recogidos;
     unsigned int profundidad_maxima;
     Configuracion limites;
     struct timespec inicio;
@@ -139,6 +149,7 @@ typedef struct
 {
     Solicitud solicitud;
     Resultado resultado;
+    Configuracion configuracion;
     double tiempo_transcurrido_segundos;
 } RegistroSolicitud;
 
@@ -177,6 +188,8 @@ static void aplicar_cancelacion(Resultado *resultado, const AvisoCancelacion *av
 {
     resultado->estado = RESULTADO_NO_COMPLETADO;
     resultado->caos_planetario = aviso->motivo == AVISO_PLAZO;
+    resultado->interrumpida = aviso->motivo == AVISO_INTERRUPCION;
+    resultado->presupuesto_agotado = false;
     resultado->ganador = aviso->ganador;
     if (aviso->motivo == AVISO_RESUELTO)
         snprintf(resultado->detalle, sizeof(resultado->detalle),
@@ -184,6 +197,8 @@ static void aplicar_cancelacion(Resultado *resultado, const AvisoCancelacion *av
     else if (aviso->motivo == AVISO_PLAZO)
         snprintf(resultado->detalle, sizeof(resultado->detalle),
                  "Caos planetario: se alcanzo el plazo de ejecucion.");
+    else if (aviso->motivo == AVISO_INTERRUPCION)
+        snprintf(resultado->detalle, sizeof(resultado->detalle), "Solicitud interrumpida por el usuario.");
     else
         snprintf(resultado->detalle, sizeof(resultado->detalle),
                  "Cancelacion por error o cierre del pipe del padre.");
@@ -196,7 +211,7 @@ static bool recibir_aviso(int entrada, AvisoCancelacion *aviso)
         *aviso = (AvisoCancelacion){.motivo = AVISO_ERROR};
         return false;
     }
-    if (aviso->motivo < AVISO_RESUELTO || aviso->motivo > AVISO_ERROR)
+    if (aviso->motivo < AVISO_RESUELTO || aviso->motivo > AVISO_INTERRUPCION)
     {
         *aviso = (AvisoCancelacion){.motivo = AVISO_ERROR};
         errno = EPROTO;
@@ -241,32 +256,93 @@ static double diferencia_segundos(const struct timespec *inicio, const struct ti
            (double)(fin->tv_nsec - inicio->tv_nsec) / 1000000000.0;
 }
 
+static double plazo_efectivo(const Configuracion *configuracion)
+{
+    return configuracion->modo_experimental ? configuracion->limite_extraordinario :
+                                             configuracion->plazo_segundos;
+}
+
+static bool leer_variable_positiva(const char *nombre, double maximo, double *valor)
+{
+    const char *texto = getenv(nombre);
+    if (texto == NULL)
+        return true;
+    char *fin;
+    errno = 0;
+    double numero = strtod(texto, &fin);
+    if (fin == texto || *fin != '\0' || errno == ERANGE || !isfinite(numero) ||
+        numero <= 0.0 || numero > maximo)
+    {
+        fprintf(stderr, "Configuracion invalida en %s.\n", nombre);
+        return false;
+    }
+    *valor = numero;
+    return true;
+}
+
 static bool cargar_configuracion(Configuracion *configuracion)
 {
-    *configuracion = (Configuracion){PROCESOS_PREDETERMINADOS, PLAZO_PREDETERMINADO};
-    const char *nombres[] = {"MEESEEKS_MAX_PROCESOS", "MEESEEKS_PLAZO_SEGUNDOS"};
-
-    for (size_t i = 0; i < 2; i++)
+    *configuracion = (Configuracion){.max_procesos = PROCESOS_PREDETERMINADOS,
+                                    .plazo_segundos = PLAZO_PREDETERMINADO};
+    double procesos = configuracion->max_procesos;
+    if (!leer_variable_positiva("MEESEEKS_MAX_PROCESOS", MAX_PROCESOS, &procesos) ||
+        !leer_variable_positiva("MEESEEKS_PLAZO_SEGUNDOS", PLAZO_MAXIMO, &configuracion->plazo_segundos))
+        return false;
+    if (floor(procesos) != procesos)
     {
-        const char *texto = getenv(nombres[i]);
-        if (texto == NULL)
-            continue;
+        fputs("MEESEEKS_MAX_PROCESOS debe ser entero.\n", stderr);
+        return false;
+    }
+    configuracion->max_procesos = (unsigned int)procesos;
 
-        char *fin;
-        errno = 0;
-        double valor = strtod(texto, &fin);
-        if (fin == texto || *fin != '\0' || errno == ERANGE || !isfinite(valor) ||
-            valor <= 0.0 || (i == 0 && (valor > MAX_PROCESOS || floor(valor) != valor)) ||
-            (i == 1 && valor > PLAZO_MAXIMO))
+    const char *modo = getenv("MEESEEKS_EXPERIMENTAL");
+    if (modo != NULL && strcmp(modo, "0") != 0 && strcmp(modo, "1") != 0)
+    {
+        fputs("MEESEEKS_EXPERIMENTAL debe ser 0 o 1.\n", stderr);
+        return false;
+    }
+    configuracion->modo_experimental = modo != NULL && strcmp(modo, "1") == 0;
+    const char *extra = getenv("MEESEEKS_LIMITE_EXTRAORDINARIO");
+    if ((configuracion->modo_experimental && extra == NULL) ||
+        (!configuracion->modo_experimental && extra != NULL))
+    {
+        fputs("El modo experimental requiere un limite extraordinario explicito y viceversa.\n", stderr);
+        return false;
+    }
+    if (!leer_variable_positiva("MEESEEKS_LIMITE_EXTRAORDINARIO", PLAZO_MAXIMO,
+                                &configuracion->limite_extraordinario))
+        return false;
+    if (configuracion->modo_experimental && configuracion->limite_extraordinario <= configuracion->plazo_segundos)
+    {
+        fputs("El limite extraordinario debe superar el plazo normal.\n", stderr);
+        return false;
+    }
+
+    const char *semilla = getenv("MEESEEKS_SEMILLA");
+    if (semilla != NULL)
+    {
+        if (*semilla == '\0' || strspn(semilla, "0123456789") != strlen(semilla))
         {
-            fprintf(stderr, "Configuracion invalida en %s.\n", nombres[i]);
+            fputs("MEESEEKS_SEMILLA debe ser un entero entre 0 y 4294967295.\n", stderr);
             return false;
         }
-
-        if (i == 0)
-            configuracion->max_procesos = (unsigned int)valor;
-        else
-            configuracion->plazo_segundos = valor;
+        char *fin;
+        errno = 0;
+        unsigned long long valor = strtoull(semilla, &fin, 10);
+        if (*fin != '\0' || errno == ERANGE || valor > UINT32_MAX)
+        {
+            fputs("MEESEEKS_SEMILLA fuera de rango.\n", stderr);
+            return false;
+        }
+        configuracion->semilla = (uint32_t)valor;
+    }
+    else
+    {
+        struct timespec ahora;
+        if (clock_gettime(CLOCK_MONOTONIC, &ahora) == -1)
+            return false;
+        configuracion->semilla = (uint32_t)ahora.tv_nsec ^ (uint32_t)ahora.tv_sec ^
+                                ((uint32_t)getpid() * 2654435761u);
     }
     return true;
 }
@@ -316,7 +392,7 @@ static double tiempo_disponible(const ControlCompartido *control)
     struct timespec ahora;
     if (clock_gettime(CLOCK_MONOTONIC, &ahora) == -1)
         return -1.0;
-    double restante = control->limites.plazo_segundos -
+    double restante = plazo_efectivo(&control->limites) -
                       diferencia_segundos(&control->inicio, &ahora);
     return fmax(0.0, restante);
 }
@@ -344,6 +420,8 @@ static bool liberar_meeseeks(ControlCompartido *control, unsigned int cantidad, 
     control->activos -= cantidad;
     if (fallo_fork)
         control->creados -= cantidad;
+    else
+        control->recogidos += cantidad;
     return sem_post(&control->mutex) == 0;
 }
 
@@ -365,9 +443,26 @@ static unsigned int ayuda_necesaria(double facilidad)
     return facilidad > 85.0 ? 0 : (facilidad <= 45.0 ? 5 : 2);
 }
 
-static double aleatorio_uniforme(unsigned int *semilla)
+static uint32_t derivar_semilla(uint32_t base, uint32_t instancia)
 {
-    return (double)rand_r(semilla) / ((double)RAND_MAX + 1.0);
+    uint32_t valor = base ^ (instancia * 0x9e3779b9u);
+    valor ^= valor >> 16;
+    valor *= 0x85ebca6bu;
+    valor ^= valor >> 13;
+    valor *= 0xc2b2ae35u;
+    valor ^= valor >> 16;
+    return valor;
+}
+
+static double aleatorio_uniforme(uint32_t *semilla)
+{
+    /* Xorshift32: secuencia definida en C, independiente del PID y de libc. */
+    uint32_t valor = *semilla == 0 ? 0x6d2b79f5u : *semilla;
+    valor ^= valor << 13;
+    valor ^= valor >> 17;
+    valor ^= valor << 5;
+    *semilla = valor;
+    return (double)valor / 4294967296.0;
 }
 
 static bool esperar_simulacion(double duracion, const ControlCompartido *control,
@@ -440,15 +535,11 @@ static bool esperar_simulacion(double duracion, const ControlCompartido *control
 static bool procesar_texto(const Solicitud *solicitud, int entrada,
                           ControlCompartido *control, Resultado *resultado)
 {
-    struct timespec ahora;
-    if (clock_gettime(CLOCK_MONOTONIC, &ahora) == -1)
-        return false;
-    unsigned int semilla = (unsigned int)ahora.tv_nsec ^ (unsigned int)ahora.tv_sec ^
-                           ((unsigned int)getpid() * 2654435761u) ^ resultado->nivel;
+    uint32_t semilla = solicitud->semilla;
     double duracion = solicitud->tiempo_aleatorio ?
                       0.5 + 4.5 * aleatorio_uniforme(&semilla) : solicitud->tiempo_segundos;
     double probabilidad = probabilidad_resolver(solicitud->facilidad, resultado->nivel);
-    mensaje_meeseeks(resultado, "facilidad efectiva %.4f, probabilidad %.4f%%, simulacion %.4f segundos.",
+    mensaje_meeseeks(resultado, "facilidad efectiva %.9g, probabilidad %.9g%%, simulacion %.4f segundos.",
                      facilidad_por_generacion(solicitud->facilidad, resultado->nivel),
                      100.0 * probabilidad, duracion);
 
@@ -601,7 +692,7 @@ static int leer_opcion(void)
     return (int)numero;
 }
 
-static bool capturar_datos_textuales(Solicitud *solicitud)
+static bool capturar_datos_textuales(Solicitud *solicitud, uint32_t *semilla)
 {
     puts("\n--- CONFIGURACION DE TAREA TEXTUAL ---");
     puts("Facilidad: 0 = imposible, 100 = muy facil.");
@@ -639,7 +730,7 @@ static bool capturar_datos_textuales(Solicitud *solicitud)
         if (opcion == 2)
         {
             /* Distribucion uniforme sobre la escala, incluyendo decimales. */
-            solicitud->facilidad = 100.0 * (double)rand() / (double)RAND_MAX;
+            solicitud->facilidad = 100.0 * aleatorio_uniforme(semilla);
             solicitud->facilidad_aleatoria = true;
             break;
         }
@@ -700,7 +791,7 @@ static void mostrar_solicitud(const Solicitud *solicitud, size_t numero)
 
     if (solicitud->tipo == TIPO_TEXTO)
     {
-        printf("Box: facilidad: %.2f/100 (%s)\n",
+        printf("Box: facilidad: %.9g/100 (%s)\n",
                solicitud->facilidad,
                solicitud->facilidad_aleatoria ? "aleatoria" : "manual");
 
@@ -874,10 +965,9 @@ static bool terminar_programa(pid_t pid, int *estado)
     return esperar_proceso(pid, estado);
 }
 
-static bool esperar_programa_limitado(pid_t pid, int *estado,
-                                     const ControlCompartido *control, bool *vencido)
+static bool esperar_programa_limitado(pid_t pid, int *estado, int entrada,
+                                     const ControlCompartido *control, AvisoCancelacion *aviso)
 {
-    *vencido = false;
     while (1)
     {
         pid_t esperado = waitpid(pid, estado, WNOHANG);
@@ -889,24 +979,32 @@ static bool esperar_programa_limitado(pid_t pid, int *estado,
                 continue;
             return false;
         }
-
         double restante = tiempo_disponible(control);
         if (restante <= 0.0)
         {
             int error = errno;
             bool recogido = terminar_programa(pid, estado);
-            *vencido = restante == 0.0;
+            aviso->motivo = restante == 0.0 ? AVISO_PLAZO : AVISO_ERROR;
             if (restante < 0.0)
                 errno = error;
             return restante == 0.0 && recogido;
         }
-        struct timespec intervalo = {0, (long)ceil(fmin(INTERVALO_REVISION, restante) * 1000000000.0)};
-        if (nanosleep(&intervalo, NULL) == -1 && errno != EINTR)
+        struct pollfd canal = {.fd = entrada, .events = POLLIN};
+        int eventos = poll(&canal, 1, (int)ceil(fmin(INTERVALO_REVISION, restante) * 1000.0));
+        if (eventos == -1 && errno == EINTR)
+            continue;
+        if (eventos == -1 || (canal.revents & (POLLERR | POLLNVAL)))
         {
             int error = errno;
             (void)terminar_programa(pid, estado);
             errno = error;
             return false;
+        }
+        if (canal.revents & (POLLIN | POLLHUP))
+        {
+            bool recibido = recibir_aviso(entrada, aviso);
+            bool recogido = terminar_programa(pid, estado);
+            return recibido && recogido && aviso->motivo != AVISO_ERROR;
         }
     }
 }
@@ -1012,9 +1110,10 @@ static bool leer_error_ejecucion(int descriptor, int *error_ejecucion)
                          sizeof(*error_ejecucion) - (size_t)leidos);
 }
 
-static void ejecutar_programa_hijo(char *const argumentos[], int errores, int respuesta)
+static void ejecutar_programa_hijo(char *const argumentos[], int errores, int respuesta, int cancelaciones)
 {
     close(respuesta);
+    close(cancelaciones);
     int error_ejecucion = setpgid(0, 0) == -1 ? errno : 0;
 
     /* El programa no debe consumir las siguientes opciones de la Box. */
@@ -1027,6 +1126,13 @@ static void ejecutar_programa_hijo(char *const argumentos[], int errores, int re
             error_ejecucion = errno;
         close(entrada);
     }
+
+    sigset_t desbloquear;
+    sigemptyset(&desbloquear);
+    sigaddset(&desbloquear, SIGINT);
+    sigaddset(&desbloquear, SIGTERM);
+    if (sigprocmask(SIG_UNBLOCK, &desbloquear, NULL) == -1)
+        error_ejecucion = errno;
 
     struct sigaction accion = {0};
     accion.sa_handler = SIG_DFL;
@@ -1045,7 +1151,7 @@ static void ejecutar_programa_hijo(char *const argumentos[], int errores, int re
     _exit(127);
 }
 
-static void procesar_programa(const char *contenido, int respuesta,
+static void procesar_programa(const char *contenido, int respuesta, int entrada,
                               ControlCompartido *control, Resultado *resultado)
 {
     resultado->estado = RESULTADO_NO_COMPLETADO;
@@ -1096,7 +1202,7 @@ static void procesar_programa(const char *contenido, int respuesta,
     if (pid == 0)
     {
         close(errores[0]);
-        ejecutar_programa_hijo(argumentos, errores[1], respuesta);
+        ejecutar_programa_hijo(argumentos, errores[1], respuesta, entrada);
     }
 
     close(errores[1]);
@@ -1113,8 +1219,8 @@ static void procesar_programa(const char *contenido, int respuesta,
     }
 
     int estado;
-    bool vencido;
-    if (!esperar_programa_limitado(pid, &estado, control, &vencido))
+    AvisoCancelacion aviso = {0};
+    if (!esperar_programa_limitado(pid, &estado, entrada, control, &aviso))
     {
         int error = errno;
         close(errores[0]);
@@ -1139,12 +1245,8 @@ static void procesar_programa(const char *contenido, int respuesta,
 
     resultado->tiempo_programa_segundos = diferencia_segundos(&inicio, &fin);
 
-    if (vencido)
-    {
-        resultado->caos_planetario = true;
-        snprintf(resultado->detalle, sizeof(resultado->detalle),
-                 "Caos planetario: plazo agotado; programa terminado y recogido.");
-    }
+    if (aviso.motivo != AVISO_NINGUNO)
+        aplicar_cancelacion(resultado, &aviso);
     else if (!comunicado)
         snprintf(resultado->detalle, sizeof(resultado->detalle),
                  "Error al recibir el estado de ejecucion: %s.", strerror(error_comunicacion));
@@ -1256,7 +1358,8 @@ static bool avisar_hijos(HijoMeeseeks hijos[], unsigned int cantidad,
                              (long)hijos[i].pid, (long)aviso->ganador.pid);
         else
             mensaje_meeseeks(padre, "Aviso por pipe a hijo PID %ld: cancelar por %s.",
-                             (long)hijos[i].pid, aviso->motivo == AVISO_PLAZO ? "plazo" : "error");
+                             (long)hijos[i].pid, aviso->motivo == AVISO_PLAZO ? "plazo" :
+                             (aviso->motivo == AVISO_INTERRUPCION ? "interrupcion" : "error"));
     }
     return correcto;
 }
@@ -1276,7 +1379,7 @@ static bool recoger_hijo(HijoMeeseeks *hijo, ControlCompartido *control,
     if (hijo->envio >= 0)
         close(hijo->envio);
     hijo->envio = -1;
-    bool liberado = liberar_meeseeks(control, 1, false);
+    bool liberado = recogido && liberar_meeseeks(control, 1, false);
     mensaje_meeseeks(padre, "Recogi con waitpid al hijo PID %ld.", (long)hijo->pid);
     hijo->pid = 0;
     if (!recibido)
@@ -1376,6 +1479,7 @@ static bool esperar_hijos(int entrada, HijoMeeseeks hijos[], unsigned int cantid
             else if (aviso.motivo == AVISO_NINGUNO && respuesta.estado == RESULTADO_COMPLETADO)
             {
                 resultado->estado = RESULTADO_COMPLETADO;
+                resultado->presupuesto_agotado = false;
                 resultado->ganador = respuesta.ganador;
                 snprintf(resultado->detalle, sizeof(resultado->detalle), "%s", respuesta.detalle);
                 aviso = (AvisoCancelacion){AVISO_RESUELTO, respuesta.ganador};
@@ -1399,6 +1503,7 @@ static bool esperar_hijos(int entrada, HijoMeeseeks hijos[], unsigned int cantid
     if (aviso.motivo == AVISO_NINGUNO)
     {
         resultado->estado = RESULTADO_NO_COMPLETADO;
+        resultado->presupuesto_agotado = true;
         snprintf(resultado->detalle, sizeof(resultado->detalle),
                  "Ningun descendiente resolvio la solicitud dentro del presupuesto.");
     }
@@ -1423,6 +1528,7 @@ static bool solicitar_ayuda(const Solicitud *solicitud, int entrada, int salida,
         else
         {
             resultado->estado = RESULTADO_NO_COMPLETADO;
+            resultado->presupuesto_agotado = true;
             snprintf(resultado->detalle, sizeof(resultado->detalle),
                      "Presupuesto insuficiente para crear el grupo de %u hijos.", cantidad);
         }
@@ -1435,7 +1541,9 @@ static bool solicitar_ayuda(const Solicitud *solicitud, int entrada, int salida,
     bool correcto = true;
     for (unsigned int i = 0; i < cantidad; i++)
     {
-        bool iniciado = iniciar_hijo(solicitud, resultado->nivel + 1, i + 1,
+        Solicitud solicitud_hijo = *solicitud;
+        solicitud_hijo.semilla = derivar_semilla(solicitud->semilla, i + 1);
+        bool iniciado = iniciar_hijo(&solicitud_hijo, resultado->nivel + 1, i + 1,
                                      entrada, salida, hijos, creados, &hijos[i], control);
         if (hijos[i].pid > 0)
         {
@@ -1502,7 +1610,7 @@ static int meeseeks(int entrada, int salida, unsigned int nivel, unsigned int in
         else if (solicitud.tipo == TIPO_CALCULO)
             procesar_calculo(solicitud.contenido, &resultado);
         else if (solicitud.tipo == TIPO_PROGRAMA)
-            procesar_programa(solicitud.contenido, salida, control, &resultado);
+            procesar_programa(solicitud.contenido, salida, entrada, control, &resultado);
 
         if (resultado.estado == RESULTADO_COMPLETADO && resultado.ganador.pid == 0)
             resultado.ganador = (IdentidadMeeseeks){resultado.pid, resultado.ppid, nivel, instancia};
@@ -1524,11 +1632,12 @@ static int meeseeks(int entrada, int salida, unsigned int nivel, unsigned int in
     return correcto && enviado ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
-static bool esperar_meeseeks(pid_t pid)
+static bool esperar_meeseeks(pid_t pid, bool *recogido)
 {
     int estado;
 
-    if (!esperar_proceso(pid, &estado))
+    *recogido = esperar_proceso(pid, &estado);
+    if (!*recogido)
     {
         perror("Error al esperar al Meeseeks");
         return false;
@@ -1550,6 +1659,65 @@ static bool esperar_meeseeks(pid_t pid)
     return true;
 }
 
+static int consultar_interrupcion(void)
+{
+    sigset_t senales;
+    sigemptyset(&senales);
+    sigaddset(&senales, SIGINT);
+    sigaddset(&senales, SIGTERM);
+    struct timespec sin_espera = {0};
+    int signo = sigtimedwait(&senales, NULL, &sin_espera);
+    if (signo == -1 && (errno == EAGAIN || errno == EINTR))
+        return 0;
+    return signo;
+}
+
+static bool recibir_resultado_raiz(HijoMeeseeks *hijo, Resultado *resultado,
+                                  const ControlCompartido *control)
+{
+    bool aviso_enviado = false;
+    bool plazo_normal_notificado = false;
+    while (1)
+    {
+        double restante = tiempo_disponible(control);
+        if (restante < 0.0)
+            return false;
+        int signo = consultar_interrupcion();
+        if (signo == -1)
+            return false;
+        double transcurrido = plazo_efectivo(&control->limites) - restante;
+        if (control->limites.modo_experimental && !plazo_normal_notificado &&
+            transcurrido >= control->limites.plazo_segundos)
+        {
+            printf("Box: plazo normal superado; modo experimental activo hasta %.3f segundos.\n",
+                   control->limites.limite_extraordinario);
+            fflush(stdout);
+            plazo_normal_notificado = true;
+        }
+        if (!aviso_enviado && (signo != 0 || restante == 0.0))
+        {
+            AvisoCancelacion aviso = {.motivo = signo != 0 ? AVISO_INTERRUPCION : AVISO_PLAZO};
+            if (!escribir_completo(hijo->envio, &aviso, sizeof(aviso)) && errno != EPIPE)
+                return false;
+            aviso_enviado = true;
+            puts(signo != 0 ? "Box: interrupcion recibida; cancelando y recogiendo el arbol." :
+                             "Box: limite efectivo alcanzado; cancelando y recogiendo el arbol.");
+            fflush(stdout);
+        }
+        double pausa = aviso_enviado ? 0.1 : fmin(0.1, restante);
+        if (control->limites.modo_experimental && !plazo_normal_notificado)
+            pausa = fmin(pausa, fmax(0.0, control->limites.plazo_segundos - transcurrido));
+        struct pollfd canal = {.fd = hijo->recepcion, .events = POLLIN};
+        int eventos = poll(&canal, 1, (int)ceil(pausa * 1000.0));
+        if (eventos == -1 && errno == EINTR)
+            continue;
+        if (eventos == -1 || (canal.revents & (POLLERR | POLLNVAL)))
+            return false;
+        if (canal.revents & (POLLIN | POLLHUP))
+            return leer_completo(hijo->recepcion, resultado, sizeof(*resultado));
+    }
+}
+
 /* La Box usa los mismos canales privados que los padres del arbol. */
 static bool crear_meeseeks(const Solicitud *solicitud, Resultado *resultado,
                            ControlCompartido *control)
@@ -1569,6 +1737,7 @@ static bool crear_meeseeks(const Solicitud *solicitud, Resultado *resultado,
         if (restante < 0.0)
             return false;
         resultado->caos_planetario = restante == 0.0;
+        resultado->presupuesto_agotado = restante > 0.0;
         snprintf(resultado->detalle, sizeof(resultado->detalle),
                  restante == 0.0 ? "Caos planetario: plazo agotado antes de fork." :
                  "Presupuesto de procesos agotado.");
@@ -1597,7 +1766,7 @@ static bool crear_meeseeks(const Solicitud *solicitud, Resultado *resultado,
     }
 
     Resultado respuesta = {0};
-    bool recibido = leer_completo(hijo.recepcion, &respuesta, sizeof(respuesta));
+    bool recibido = comunicado && recibir_resultado_raiz(&hijo, &respuesta, control);
     if (!recibido)
     {
         perror("Error al recibir el resultado");
@@ -1606,10 +1775,11 @@ static bool crear_meeseeks(const Solicitud *solicitud, Resultado *resultado,
         hijo.envio = -1;
     }
     close(hijo.recepcion);
-    bool terminado = esperar_meeseeks(hijo.pid);
+    bool recogido = false;
+    bool terminado = esperar_meeseeks(hijo.pid, &recogido);
     if (hijo.envio >= 0)
         close(hijo.envio);
-    bool liberado = liberar_meeseeks(control, 1, false);
+    bool liberado = recogido && liberar_meeseeks(control, 1, false);
     if (recibido)
         *resultado = respuesta;
     return comunicado && recibido && terminado && liberado;
@@ -1617,6 +1787,7 @@ static bool crear_meeseeks(const Solicitud *solicitud, Resultado *resultado,
 
 static bool procesar_solicitud(RegistroSolicitud *registro, const Configuracion *configuracion)
 {
+    registro->configuracion = *configuracion;
     struct timespec inicio;
     if (clock_gettime(CLOCK_MONOTONIC, &inicio) == -1)
     {
@@ -1632,11 +1803,33 @@ static bool procesar_solicitud(RegistroSolicitud *registro, const Configuracion 
         perror("Error al crear memoria compartida o semaforo");
         return false;
     }
+    sigset_t bloqueo, anteriores;
+    sigemptyset(&bloqueo);
+    sigaddset(&bloqueo, SIGINT);
+    sigaddset(&bloqueo, SIGTERM);
+    if (sigprocmask(SIG_BLOCK, &bloqueo, &anteriores) == -1)
+    {
+        perror("Error al preparar cancelacion por senales");
+        sem_destroy(&control->mutex);
+        munmap(control, sizeof(*control));
+        return false;
+    }
     bool procesada = crear_meeseeks(&registro->solicitud, &registro->resultado, control);
+    /* La Box consume las senales pendientes antes de restaurar su mascara. */
+    while (consultar_interrupcion() > 0)
+    {
+    }
+    if (sigprocmask(SIG_SETMASK, &anteriores, NULL) == -1)
+    {
+        perror("Error al restaurar la mascara de senales");
+        procesada = false;
+    }
     /* El hijo ya fue recogido: solo la Box destruye los recursos compartidos. */
     registro->resultado.meeseeks_creados = control->creados;
     registro->resultado.profundidad_maxima = control->profundidad_maxima;
-    if (control->activos != 0)
+    registro->resultado.meeseeks_recogidos = control->recogidos;
+    registro->resultado.activos_al_final = control->activos;
+    if (control->activos != 0 || control->recogidos != control->creados)
     {
         fputs("Box: contador de procesos activos inconsistente.\n", stderr);
         procesada = false;
@@ -1663,6 +1856,17 @@ static bool procesar_solicitud(RegistroSolicitud *registro, const Configuracion 
     return procesada;
 }
 
+static void mostrar_configuracion_registro(const RegistroSolicitud *registro)
+{
+    const Configuracion *configuracion = &registro->configuracion;
+    printf("Modo: %s. Plazo normal: %.3f s. Limite efectivo: %.3f s. Presupuesto: %u.\n",
+           configuracion->modo_experimental ? "experimental" : "normal",
+           configuracion->plazo_segundos, plazo_efectivo(configuracion), configuracion->max_procesos);
+    printf("Semilla base: %u. Semilla solicitud: %u. Supero duracion normal: %s.\n",
+           (unsigned int)configuracion->semilla, (unsigned int)registro->solicitud.semilla,
+           registro->tiempo_transcurrido_segundos > configuracion->plazo_segundos ? "si" : "no");
+}
+
 static void mostrar_resultado(const Resultado *resultado)
 {
     if (resultado->pid > 0)
@@ -1677,8 +1881,9 @@ static void mostrar_resultado(const Resultado *resultado)
                (long)resultado->ganador.pid, (long)resultado->ganador.ppid,
                resultado->ganador.nivel, resultado->ganador.instancia);
     printf("Box: solicitud %s.\n", nombre_estado(resultado->estado));
-    printf("Box: Meeseeks creados: %u. Profundidad maxima: %u.\n",
-           resultado->meeseeks_creados, resultado->profundidad_maxima);
+    printf("Box: Meeseeks creados: %u. Recogidos: %u. Activos al cerrar: %u. Profundidad maxima: %u.\n",
+           resultado->meeseeks_creados, resultado->meeseeks_recogidos,
+           resultado->activos_al_final, resultado->profundidad_maxima);
 
     if (resultado->detalle[0] != '\0')
         printf("Box: %s\n", resultado->detalle);
@@ -1710,9 +1915,18 @@ static void mostrar_informe(const RegistroSolicitud historial[], size_t cantidad
     size_t completadas = 0;
     size_t no_completadas = 0;
     size_t pendientes = 0;
+    size_t caos = 0;
+    size_t recursos = 0;
+    size_t interrumpidas = 0;
+    size_t extendidas = 0;
 
     for (size_t i = 0; i < cantidad; i++)
     {
+        caos += historial[i].resultado.caos_planetario;
+        recursos += historial[i].resultado.presupuesto_agotado;
+        interrumpidas += historial[i].resultado.interrumpida;
+        extendidas += historial[i].configuracion.modo_experimental &&
+                      historial[i].tiempo_transcurrido_segundos > historial[i].configuracion.plazo_segundos;
         switch (historial[i].resultado.estado)
         {
             case RESULTADO_COMPLETADO:
@@ -1731,14 +1945,18 @@ static void mostrar_informe(const RegistroSolicitud historial[], size_t cantidad
     printf("Total de solicitudes recibidas: %zu\n", cantidad);
     printf("Completadas: %zu\nNo completadas: %zu\nPendientes: %zu\n",
            completadas, no_completadas, pendientes);
+    printf("Caos planetario: %zu. Fin por presupuesto: %zu. Interrumpidas: %zu.\n", caos, recursos, interrumpidas);
+    printf("Experimentales que superaron duracion normal: %zu.\n", extendidas);
 
     for (size_t i = 0; i < cantidad; i++)
     {
         const RegistroSolicitud *registro = &historial[i];
         printf("\nSolicitud #%zu (%s): \"%s\"\n", i + 1,
                nombre_tipo(registro->solicitud.tipo), registro->solicitud.contenido);
-        printf("Estado: %s. Meeseeks creados: %u.\n",
-               nombre_estado(registro->resultado.estado), registro->resultado.meeseeks_creados);
+        mostrar_configuracion_registro(registro);
+        printf("Estado: %s. Meeseeks creados: %u. Recogidos: %u. Activos al cerrar: %u.\n",
+               nombre_estado(registro->resultado.estado), registro->resultado.meeseeks_creados,
+               registro->resultado.meeseeks_recogidos, registro->resultado.activos_al_final);
         printf("Profundidad maxima: %u. Caos planetario: %s.\n",
                registro->resultado.profundidad_maxima,
                registro->resultado.caos_planetario ? "si" : "no");
@@ -1779,8 +1997,10 @@ static int box(void)
         return EXIT_FAILURE;
     }
 
-    /* La semilla se configura una sola vez durante la ejecucion de Box. */
-    srand((unsigned int)time(NULL));
+    uint32_t semilla_captura = configuracion.semilla;
+    printf("Box: modo %s; limite efectivo %.3f segundos; semilla base %u.\n",
+           configuracion.modo_experimental ? "experimental" : "normal",
+           plazo_efectivo(&configuracion), (unsigned int)configuracion.semilla);
 
     while(1)
     {
@@ -1831,7 +2051,7 @@ static int box(void)
         strcpy(solicitud.contenido, texto);
 
         if (solicitud.tipo == TIPO_TEXTO &&
-            !capturar_datos_textuales(&solicitud))
+            !capturar_datos_textuales(&solicitud, &semilla_captura))
         {
             if (ferror(stdin))
             {
@@ -1847,6 +2067,7 @@ static int box(void)
             continue;
         }
 
+        solicitud.semilla = derivar_semilla(configuracion.semilla, (uint32_t)(total_solicitudes + 1));
         if (!registrar_solicitud(&historial, &total_solicitudes, &solicitud))
         {
             perror("Error al reservar el registro de la solicitud");

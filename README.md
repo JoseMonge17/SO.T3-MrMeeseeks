@@ -47,6 +47,8 @@ interfaces de procesos y memoria compartida.
 8. Memoria compartida, semáforo, presupuesto y plazo de ejecución.
 9. Árbol recursivo con grupos completos de hijos y tabulaciones por nivel.
 10. Resolución y cancelación en cascada por pipes, ganador y recolección del árbol.
+11. Modo experimental con límite extraordinario, cancelación por señales e informe completo.
+12. Semillas configurables para repetir los sorteos.
 
 ## Organización del código
 
@@ -55,7 +57,7 @@ interfaces de procesos y memoria compartida.
 `AvisoCancelacion` comunica resolución, plazo o error; `HijoMeeseeks` guarda el
 PID y los descriptores de cada hijo directo.
 `RegistroSolicitud` conserva la petición, el resultado y su tiempo total.
-`Configuracion` contiene los límites; `ControlCompartido` contiene el semáforo,
+`Configuracion` contiene los límites, el modo y la semilla base; `ControlCompartido` contiene el semáforo,
 contadores y el inicio del plazo. Las solicitudes siguen viajando por pipes.
 
 | Parte | Funciones principales |
@@ -71,6 +73,7 @@ contadores y el inicio del plazo. Las solicitudes siguen viajando por pipes.
 | Simulación | `facilidad_por_generacion()`, `probabilidad_resolver()`, `ayuda_necesaria()`, `aleatorio_uniforme()`, `esperar_simulacion()`, `procesar_texto()`. |
 | Sincronización | `crear_control()`, `bloquear_control()`, `reservar_meeseeks()`, `liberar_meeseeks()`, `tiempo_disponible()`. |
 | Tiempos e historial | `procesar_solicitud()`, `diferencia_segundos()`, `tiempo_sin_simulacion()`, `mostrar_tiempos()`, `registrar_solicitud()`, `mostrar_informe()`. |
+| Contingencia | `plazo_efectivo()`, `consultar_interrupcion()` y `recibir_resultado_raiz()` supervisan el plazo y la cancelación. |
 
 ## Bibliotecas y solicitudes
 
@@ -84,7 +87,8 @@ Su código y licencia zlib se conservan en `vendor/tinyexpr`, revisión
 
 - **Texto:** facilidad decimal entre 0 y 100, manual o uniforme aleatoria. Duración
   positiva manual o uniforme entre 0.5 y 5 segundos, generada por el Meeseeks.
-  Cancelar no registra una solicitud.
+  Cancelar durante la captura no registra una solicitud; interrumpirla cuando
+  ya está ejecutándose sí queda registrado.
 - **Cálculos:** números, paréntesis, `+ - * / % ^`, comparaciones
   `< <= > >= == !=` y lógica `&& || !`. La evaluación usa `double`, punto decimal
   y resultados lógicos 0 o 1. No admite funciones ni variables. `2^3^2` da 512 y
@@ -115,8 +119,12 @@ resuelve siempre, siempre que termine la simulación antes del plazo. F=0 nunca
 se resuelve, ni por aging ni por un sorteo favorable.
 
 Después de esperar, el Meeseeks compara un sorteo uniforme en [0,1) con P. Usa
-un estado local de `rand_r()`, iniciado con reloj, PID y nivel para evitar heredar
-la misma secuencia después de `fork()`. No es un generador criptográfico.
+Xorshift32 con estado local: `MEESEEKS_SEMILLA` fija la semilla base y
+`derivar_semilla()` obtiene una semilla por solicitud y por ruta de hijos. Sin
+esa variable, la Box genera la semilla con reloj y PID y la informa. Así no se
+heredan secuencias idénticas tras `fork()` y se pueden repetir los sorteos sin
+depender de la implementación de `rand_r()`. No es un generador criptográfico;
+la planificación todavía puede cambiar las ramas creadas y el ganador.
 
 Si falla, la ayuda se calcula con F original: 5 hijos para F<=45 y 2 para
 45<F<=85. Cada hijo recibe la misma solicitud por su pipe privado, con nivel
@@ -169,10 +177,16 @@ Los límites se configuran mediante variables de entorno:
 | --- | --- | --- |
 | `MEESEEKS_MAX_PROCESOS` | 128 por solicitud | Entero de 1 a 256. |
 | `MEESEEKS_PLAZO_SEGUNDOS` | 300 segundos (5 minutos) | Positivo, hasta 86400. |
+| `MEESEEKS_EXPERIMENTAL` | 0 | 0 normal, 1 experimental. |
+| `MEESEEKS_LIMITE_EXTRAORDINARIO` | Sin definir | Obligatorio solo en modo experimental, mayor que el plazo normal y hasta 86400 s. |
+| `MEESEEKS_SEMILLA` | Generada e informada | Entero de 0 a 4294967295. |
 
 El plazo comienza antes de preparar los recursos y crear al primer Meeseeks;
-incluye la espera simulada. `poll()` espera como máximo el tiempo restante y
-puede despertar antes por un mensaje. Al agotarse el plazo, el árbol se cancela
+incluye la espera simulada. En modo normal se aplica el plazo normal. El modo
+experimental continúa después de ese plazo y aplica el límite extraordinario
+explícito; mantiene el mismo presupuesto de procesos. La Box anuncia el cruce
+del plazo normal y registra si la duración total lo superó. `poll()` espera
+como máximo el tiempo restante y puede despertar antes por un mensaje. Al agotarse el plazo, el árbol se cancela
 y recoge, y se informa caos planetario. La planificación, la salida en terminal
 y la recolección pueden hacer que el tiempo observado supere el plazo; no es
 una garantía de tiempo real estricto. Si antes se agota el presupuesto sin
@@ -187,15 +201,17 @@ Se pueden usar plazos cortos para comprobar la contingencia o ampliar el límite
 una prueba larga sin quitar la protección de procesos:
 
 ```bash
-MEESEEKS_PLAZO_SEGUNDOS=900 MEESEEKS_MAX_PROCESOS=64 ./build/meeseeks
+MEESEEKS_EXPERIMENTAL=1 MEESEEKS_LIMITE_EXTRAORDINARIO=900 MEESEEKS_MAX_PROCESOS=64 ./build/meeseeks
 ```
 
-Esta configuración permite hasta 15 minutos, manteniendo un presupuesto de 64
-Meeseeks. Para ensayos largos deben elegirse duraciones que permitan superar
-los 5 minutos antes de agotar el presupuesto. Este comando no representa un
-experimento ya realizado.
+Esta configuración permite hasta 15 minutos, con presupuesto 64. No desactiva
+los límites. Durante una solicitud, Ctrl+C o SIGTERM a la Box se convierten en
+avisos por pipe: el árbol se cancela y recoge, y los programas externos reciben
+terminación y se recogen. Las señales se esperan con `sigtimedwait()` mientras
+están bloqueadas, sin variables globales para comunicar solicitudes o avisos.
+Al volver al menú se restaura la máscara original.
 
-## Medición y pruebas
+## Medición e informe
 
 El programa mide el tiempo transcurrido con `clock_gettime(CLOCK_MONOTONIC)` y
 mide las pausas realmente ejecutadas, incluidas las interrumpidas por cancelación.
@@ -208,60 +224,9 @@ de pared ajustada por una rama; no es tiempo de CPU ni una suma del trabajo de
 todos los procesos. El programa externo conserva su propia duración, incluido
 el lanzamiento y la recolección. Su sondeo puede agregar un intervalo de revisión
 y demoras del planificador. Un tiempo en -1 significa que no está disponible.
-El informe incluye estados, tiempos, creados, profundidad y ganador.
-
-Después de compilar, este comando prueba las tres opciones y una cancelación:
-
-```bash
-printf '%s\n' 2 '5+3*2' 2 '1/0' 3 'pwd' 1 'Texto facil' 1 100 1 0.05 1 'Cancelada' 0 0 | ./build/meeseeks
-```
-
-Se esperan 4 solicitudes: 3 completadas y 1 no completada. Cada una crea un Meeseeks;
-solo la textual tiene espera artificial. Para imposibilidad y presupuesto mínimo:
-
-```bash
-printf '%s\n' 1 'Imposible' 1 0 1 0.05 0 | MEESEEKS_MAX_PROCESOS=1 ./build/meeseeks
-```
-
-Debe quedar no completada por presupuesto, nunca resuelta. Para comprobar el
-grupo de 5 hijos, el mismo caso con presupuesto 6 debe crear un padre y sus cinco
-hijos, terminar por recursos y mostrar profundidad 2:
-
-```bash
-printf '%s\n' 1 'Imposible con hijos' 1 0 1 0.05 0 | MEESEEKS_MAX_PROCESOS=6 ./build/meeseeks
-```
-
-Para observar el aging y la cascada, una facilidad positiva muy baja permite
-que el árbol crezca y aumente su probabilidad. El ganador y la cantidad de
-procesos pueden variar entre corridas; también puede agotarse el presupuesto
-sin solución:
-
-```bash
-printf '%s\n' 1 'Ayuda en cascada' 1 0.000001 1 0.05 0 | ./build/meeseeks
-```
-
-Para comprobar cancelación por plazo durante el crecimiento del árbol:
-
-```bash
-printf '%s\n' 1 'Caos con hijos' 1 0 1 0.3 0 | MEESEEKS_PLAZO_SEGUNDOS=0.65 ./build/meeseeks
-```
-
-Para verificar el plazo sin esperar cinco minutos, estos comandos prueban la
-simulación individual y un programa:
-
-```bash
-printf '%s\n' 1 'Plazo' 1 100 1 10 0 | MEESEEKS_PLAZO_SEGUNDOS=0.05 ./build/meeseeks
-printf '%s\n' 3 'sleep 10' 0 | MEESEEKS_PLAZO_SEGUNDOS=0.05 ./build/meeseeks
-```
-
-Ambas deben informar caos y regresar al menú. Son resultados esperados para
-comprobar en Ubuntu, no resultados experimentales medidos. Otras comprobaciones
-incluyen entradas inválidas, `false`, salida 127, terminación por señal y
-ejecutable inexistente.
-
-## Pendiente
-
-Faltan las corridas experimentales en Ubuntu, la comparación de resultados y el
-reporte. Deben comprobarse también la ausencia de procesos restantes al volver
-al menú y los casos de cancelación con varias generaciones. Este resumen se
-actualiza al terminar cada etapa.
+El informe incluye estados, tiempos, presupuesto, modo, semillas, profundidad,
+ganador, creados, recogidos y activos al cerrar. Resume caos, fin por presupuesto,
+interrupciones y experimentales que superaron la duración normal. El cierre
+normal exige creados = recogidos y activos = 0. El informe se muestra en la
+terminal al salir del programa. Las corridas y el análisis de resultados se
+documentan por separado mediante capturas.

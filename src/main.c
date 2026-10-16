@@ -27,7 +27,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
 #include <sys/mman.h>
 #include <semaphore.h>
 #include <sys/types.h>
@@ -49,7 +48,8 @@
 #define INTERVALO_REVISION 0.01
 #define MAX_HIJOS 5
 
-typedef enum {
+typedef enum
+{
     TIPO_TEXTO = 1,
     TIPO_CALCULO = 2,
     TIPO_PROGRAMA = 3
@@ -114,10 +114,6 @@ typedef struct
     unsigned int meeseeks_creados;
     unsigned int profundidad_maxima;
     bool caos_planetario;
-    bool presupuesto_agotado;
-    bool interrumpida;
-    unsigned int meeseeks_recogidos;
-    unsigned int activos_al_final;
     IdentidadMeeseeks ganador;
     double tiempo_programa_segundos;
     double tiempo_espera_simulada_segundos;
@@ -139,7 +135,6 @@ typedef struct
     sem_t mutex;
     unsigned int creados;
     unsigned int activos;
-    unsigned int recogidos;
     unsigned int profundidad_maxima;
     Configuracion limites;
     struct timespec inicio;
@@ -149,7 +144,6 @@ typedef struct
 {
     Solicitud solicitud;
     Resultado resultado;
-    Configuracion configuracion;
     double tiempo_transcurrido_segundos;
 } RegistroSolicitud;
 
@@ -193,6 +187,28 @@ static void mensaje_meeseeks(const Resultado *resultado, const char *formato, ..
 }
 
 /*
+    Guarda un mensaje con formato en el detalle del resultado, respetando
+    el tamaño del arreglo. Centraliza los mensajes de éxito y de error.
+ */
+static void establecer_detalle(Resultado *resultado, const char *formato, ...)
+{
+    va_list argumentos;
+    va_start(argumentos, formato);
+    vsnprintf(resultado->detalle, sizeof(resultado->detalle), formato, argumentos);
+    va_end(argumentos);
+}
+
+/*
+    Cierra un descriptor abierto y lo marca con -1 para evitar volver a usarlo.
+ */
+static void cerrar_descriptor(int *descriptor)
+{
+    if (*descriptor >= 0)
+        close(*descriptor);
+    *descriptor = -1;
+}
+
+/*
     Actualiza el resultado local según el aviso de cancelación recibido.
     Registra si hubo ganador en otra rama, caos planetario, interrupción o error.
  */
@@ -200,20 +216,15 @@ static void aplicar_cancelacion(Resultado *resultado, const AvisoCancelacion *av
 {
     resultado->estado = RESULTADO_NO_COMPLETADO;
     resultado->caos_planetario = aviso->motivo == AVISO_PLAZO;
-    resultado->interrumpida = aviso->motivo == AVISO_INTERRUPCION;
-    resultado->presupuesto_agotado = false;
     resultado->ganador = aviso->ganador;
     if (aviso->motivo == AVISO_RESUELTO)
-        snprintf(resultado->detalle, sizeof(resultado->detalle),
-                 "Trabajo cancelado: gano el Meeseeks PID %ld.", (long)aviso->ganador.pid);
+        establecer_detalle(resultado, "Trabajo cancelado: gano el Meeseeks PID %ld.", (long)aviso->ganador.pid);
     else if (aviso->motivo == AVISO_PLAZO)
-        snprintf(resultado->detalle, sizeof(resultado->detalle),
-                 "Caos planetario: se alcanzo el plazo de ejecucion.");
+        establecer_detalle(resultado, "Caos planetario: se alcanzo el plazo de ejecucion.");
     else if (aviso->motivo == AVISO_INTERRUPCION)
-        snprintf(resultado->detalle, sizeof(resultado->detalle), "Solicitud interrumpida por el usuario.");
+        establecer_detalle(resultado, "Solicitud interrumpida por el usuario.");
     else
-        snprintf(resultado->detalle, sizeof(resultado->detalle),
-                 "Cancelacion por error o cierre del pipe del padre.");
+        establecer_detalle(resultado, "Cancelacion por error o cierre del pipe del padre.");
 }
 
 /*
@@ -315,9 +326,8 @@ static bool leer_variable_positiva(const char *nombre, double maximo, double *va
 }
 
 /*
-    Carga los límites y la semilla desde las variables de entorno, usando los
-    valores predeterminados cuando corresponde. Valida el presupuesto de procesos
-    y exige un límite extraordinario explícito para activar el modo experimental.
+    Carga y valida los límites desde las variables de entorno e inicializa
+    la semilla con reloj y PID. El modo experimental exige un límite extraordinario.
  */
 static bool cargar_configuracion(Configuracion *configuracion)
 {
@@ -357,32 +367,11 @@ static bool cargar_configuracion(Configuracion *configuracion)
         return false;
     }
 
-    const char *semilla = getenv("MEESEEKS_SEMILLA");
-    if (semilla != NULL)
-    {
-        if (*semilla == '\0' || strspn(semilla, "0123456789") != strlen(semilla))
-        {
-            fputs("MEESEEKS_SEMILLA debe ser un entero entre 0 y 4294967295.\n", stderr);
-            return false;
-        }
-        char *fin;
-        errno = 0;
-        unsigned long long valor = strtoull(semilla, &fin, 10);
-        if (*fin != '\0' || errno == ERANGE || valor > UINT32_MAX)
-        {
-            fputs("MEESEEKS_SEMILLA fuera de rango.\n", stderr);
-            return false;
-        }
-        configuracion->semilla = (uint32_t)valor;
-    }
-    else
-    {
-        struct timespec ahora;
-        if (clock_gettime(CLOCK_MONOTONIC, &ahora) == -1)
-            return false;
-        configuracion->semilla = (uint32_t)ahora.tv_nsec ^ (uint32_t)ahora.tv_sec ^
-                                ((uint32_t)getpid() * 2654435761u);
-    }
+    struct timespec ahora;
+    if (clock_gettime(CLOCK_MONOTONIC, &ahora) == -1)
+        return false;
+    configuracion->semilla = (uint32_t)ahora.tv_nsec ^ (uint32_t)ahora.tv_sec ^
+                            ((uint32_t)getpid() * 2654435761u);
     return true;
 }
 
@@ -471,9 +460,8 @@ static bool reservar_meeseeks(ControlCompartido *control, unsigned int cantidad,
 }
 
 /*
-    Actualiza los contadores bajo el semáforo al recoger procesos o deshacer
-    reservas que no llegaron a crearse. Una recolección reduce los activos,
-    pero conserva el total creado para no reutilizar el presupuesto de la solicitud.
+    Reduce los activos bajo el semáforo tras waitpid o al deshacer una reserva.
+    Solo descuenta del total creado las reservas que no llegaron a generar procesos.
  */
 static bool liberar_meeseeks(ControlCompartido *control, unsigned int cantidad, bool fallo_fork)
 {
@@ -482,8 +470,6 @@ static bool liberar_meeseeks(ControlCompartido *control, unsigned int cantidad, 
     control->activos -= cantidad;
     if (fallo_fork)
         control->creados -= cantidad;
-    else
-        control->recogidos += cantidad;
     return sem_post(&control->mutex) == 0;
 }
 
@@ -654,9 +640,8 @@ static bool procesar_texto(const Solicitud *solicitud, int entrada,
         resultado->estado = RESULTADO_COMPLETADO;
         resultado->ganador = (IdentidadMeeseeks){resultado->pid, resultado->ppid,
                                                resultado->nivel, resultado->instancia};
-        snprintf(resultado->detalle, sizeof(resultado->detalle),
-                 "Solicitud resuelta por el Meeseeks (PID %ld, PPID %ld, N %u, i %u).",
-                 (long)resultado->pid, (long)resultado->ppid, resultado->nivel, resultado->instancia);
+        establecer_detalle(resultado, "Solicitud resuelta por el Meeseeks (PID %ld, PPID %ld, N %u, i %u).",
+                            (long)resultado->pid, (long)resultado->ppid, resultado->nivel, resultado->instancia);
         mensaje_meeseeks(resultado, "Resolvi la solicitud; informare a mi padre por pipe.");
     }
     else
@@ -690,12 +675,6 @@ static double tiempo_sin_simulacion(const RegistroSolicitud *registro)
 static bool registrar_solicitud(RegistroSolicitud **historial, size_t *cantidad,
                                const Solicitud *solicitud)
 {
-    if (*cantidad >= SIZE_MAX / sizeof(**historial))
-    {
-        errno = ENOMEM;
-        return false;
-    }
-
     RegistroSolicitud *nuevo = realloc(*historial, (*cantidad + 1) * sizeof(*nuevo));
     if (nuevo == NULL)
         return false;
@@ -707,8 +686,7 @@ static bool registrar_solicitud(RegistroSolicitud **historial, size_t *cantidad,
     registro->resultado.estado = RESULTADO_NO_COMPLETADO;
     registro->resultado.tiempo_programa_segundos = -1.0;
     registro->tiempo_transcurrido_segundos = -1.0;
-    snprintf(registro->resultado.detalle, sizeof(registro->resultado.detalle),
-             "Fallo al crear, comunicar o recoger el Meeseeks.");
+    establecer_detalle(&registro->resultado, "Fallo al crear, comunicar o recoger el Meeseeks.");
     (*cantidad)++;
     return true;
 }
@@ -816,9 +794,40 @@ static int leer_opcion(void)
 }
 
 /*
-    Configura la facilidad y la duración de una tarea textual, con opción manual
-    o aleatoria. La facilidad aleatoria se obtiene aquí; la duración aleatoria
-    se genera en cada Meeseeks. Devuelve false al cancelar o terminar la entrada.
+    Lee una modalidad manual o aleatoria y repite las opciones inválidas.
+    Conserva 0 para cancelar y -2 para indicar el fin de entrada o un error.
+ */
+static int leer_modalidad(void)
+{
+    while (1)
+    {
+        int opcion = leer_opcion();
+        if (opcion == -2 || (opcion >= 0 && opcion <= 2))
+            return opcion;
+        puts("Opcion invalida. Seleccione 0, 1 o 2.");
+    }
+}
+
+/*
+    Reutiliza la lectura numérica y comprueba el rango de facilidad o duración.
+    Permite incluir el cero y mostrar el mensaje de error propio de cada campo.
+ */
+static bool leer_numero_en_rango(const char *mensaje, const char *error, double maximo,
+                                bool permitir_cero, double *numero)
+{
+    while (leer_numero(mensaje, numero))
+    {
+        if (*numero >= 0.0 && *numero <= maximo && (permitir_cero || *numero > 0.0))
+            return true;
+        puts(error);
+    }
+    return false;
+}
+
+/*
+    Configura facilidad y duración con modalidad manual o aleatoria.
+    La facilidad aleatoria se genera aquí; cada Meeseeks genera su duración.
+    Devuelve false al cancelar la solicitud o terminar la entrada.
  */
 static bool capturar_datos_textuales(Solicitud *solicitud, uint32_t *semilla)
 {
@@ -828,86 +837,31 @@ static bool capturar_datos_textuales(Solicitud *solicitud, uint32_t *semilla)
     puts("2. Generar facilidad aleatoriamente");
     puts("0. Cancelar solicitud");
 
-    while (1)
-    {
-        int opcion = leer_opcion();
-
-        if (opcion == 0 || opcion == -2)
-            return false;
-
-        if (opcion == 1)
-        {
-            double facilidad;
-
-            while (1)
-            {
-                if (!leer_numero("Facilidad (0 a 100): ", &facilidad))
-                    return false;
-
-                if (facilidad >= 0.0 && facilidad <= 100.0)
-                    break;
-
-                puts("La facilidad debe estar entre 0 y 100.");
-            }
-
-            solicitud->facilidad = facilidad;
-            solicitud->facilidad_aleatoria = false;
-            break;
-        }
-
-        if (opcion == 2)
-        {
-            /* Distribucion uniforme sobre la escala, incluyendo decimales. */
-            solicitud->facilidad = 100.0 * aleatorio_uniforme(semilla);
-            solicitud->facilidad_aleatoria = true;
-            break;
-        }
-
-        puts("Opcion invalida. Seleccione 0, 1 o 2.");
-    }
+    int opcion = leer_modalidad();
+    if (opcion <= 0)
+        return false;
+    solicitud->facilidad_aleatoria = opcion == 2;
+    if (solicitud->facilidad_aleatoria)
+        solicitud->facilidad = 100.0 * aleatorio_uniforme(semilla);
+    else if (!leer_numero_en_rango("Facilidad (0 a 100): ",
+                                  "La facilidad debe estar entre 0 y 100.",
+                                  100.0, true, &solicitud->facilidad))
+        return false;
 
     puts("\nDuracion de la simulacion:");
     puts("1. Definida por el usuario");
     puts("2. Aleatoria (entre 0.5 y 5 segundos)");
     puts("0. Cancelar solicitud");
 
-    while (1)
-    {
-        int opcion = leer_opcion();
-
-        if (opcion == 0 || opcion == -2)
-            return false;
-
-        if (opcion == 1)
-        {
-            double segundos;
-
-            while (1)
-            {
-                if (!leer_numero("Duracion en segundos (> 0): ", &segundos))
-                    return false;
-
-                if (segundos > 0.0)
-                    break;
-
-                puts("La duracion debe ser mayor que cero.");
-            }
-
-            solicitud->tiempo_aleatorio = false;
-            solicitud->tiempo_segundos = segundos;
-            return true;
-        }
-
-        if (opcion == 2)
-        {
-            /* Cada Meeseeks generara su propia duracion al ejecutarse. */
-            solicitud->tiempo_aleatorio = true;
-            solicitud->tiempo_segundos = 0.0;
-            return true;
-        }
-
-        puts("Opcion invalida. Seleccione 0, 1 o 2.");
-    }
+    opcion = leer_modalidad();
+    if (opcion <= 0)
+        return false;
+    solicitud->tiempo_aleatorio = opcion == 2;
+    solicitud->tiempo_segundos = 0.0;
+    return solicitud->tiempo_aleatorio ||
+           leer_numero_en_rango("Duracion en segundos (> 0): ",
+                                "La duracion debe ser mayor que cero.",
+                                INFINITY, false, &solicitud->tiempo_segundos);
 }
 
 
@@ -1033,8 +987,7 @@ static void procesar_calculo(const char *expresion, Resultado *resultado)
 
         if (isalpha((unsigned char)*actual) || *actual == '_')
         {
-            snprintf(resultado->detalle, sizeof(resultado->detalle),
-                     "Esta etapa admite numeros y operadores, sin funciones ni variables.");
+            establecer_detalle(resultado, "Esta etapa admite numeros y operadores, sin funciones ni variables.");
             return;
         }
 
@@ -1044,8 +997,7 @@ static void procesar_calculo(const char *expresion, Resultado *resultado)
     /* TinyExpr tambien evalua operaciones mientras compila la expresion. */
     if (feclearexcept(FE_ALL_EXCEPT) != 0)
     {
-        snprintf(resultado->detalle, sizeof(resultado->detalle),
-                 "No se pudo preparar la deteccion de errores numericos.");
+        establecer_detalle(resultado, "No se pudo preparar la deteccion de errores numericos.");
         return;
     }
 
@@ -1057,32 +1009,28 @@ static void procesar_calculo(const char *expresion, Resultado *resultado)
 
     if (error < 0)
     {
-        snprintf(resultado->detalle, sizeof(resultado->detalle),
-                 "Memoria insuficiente para interpretar la expresion.");
+        establecer_detalle(resultado, "Memoria insuficiente para interpretar la expresion.");
     }
     else if (error > 0)
     {
-        snprintf(resultado->detalle, sizeof(resultado->detalle),
-                 "Expresion invalida cerca de la posicion %d (contada desde 1).", error);
+        establecer_detalle(resultado, "Expresion invalida cerca de la posicion %d (contada desde 1).", error);
     }
     else if (excepciones & FE_DIVBYZERO)
     {
-        snprintf(resultado->detalle, sizeof(resultado->detalle), "Division por cero.");
+        establecer_detalle(resultado, "Division por cero.");
     }
     else if ((excepciones & FE_INVALID) || error_numerico == EDOM)
     {
-        snprintf(resultado->detalle, sizeof(resultado->detalle),
-                 "Operacion indefinida: por ejemplo 0/0, resto entre cero o potencia fuera de dominio.");
+        establecer_detalle(resultado, "Operacion indefinida: por ejemplo 0/0, resto entre cero o potencia fuera de dominio.");
     }
     else if ((excepciones & FE_OVERFLOW) || error_numerico == ERANGE || !isfinite(valor))
     {
-        snprintf(resultado->detalle, sizeof(resultado->detalle),
-                 "Resultado fuera del rango numerico admitido.");
+        establecer_detalle(resultado, "Resultado fuera del rango numerico admitido.");
     }
     else
     {
         resultado->estado = RESULTADO_COMPLETADO;
-        snprintf(resultado->detalle, sizeof(resultado->detalle), "Resultado: %.15g", valor);
+        establecer_detalle(resultado, "Resultado: %.15g", valor);
     }
 }
 
@@ -1191,8 +1139,7 @@ static bool separar_argumentos(char *comando, char *argumentos[], size_t capacid
 
         if (cantidad + 1 >= capacidad)
         {
-            snprintf(resultado->detalle, sizeof(resultado->detalle),
-                     "Maximo %zu argumentos, incluido el programa.", capacidad - 1);
+            establecer_detalle(resultado, "Maximo %zu argumentos, incluido el programa.", capacidad - 1);
             return false;
         }
 
@@ -1207,8 +1154,7 @@ static bool separar_argumentos(char *comando, char *argumentos[], size_t capacid
             {
                 if (*lectura == '\0')
                 {
-                    snprintf(resultado->detalle, sizeof(resultado->detalle),
-                             "Escape incompleto al final del comando.");
+                    establecer_detalle(resultado, "Escape incompleto al final del comando.");
                     return false;
                 }
                 *escritura++ = *lectura++;
@@ -1223,8 +1169,7 @@ static bool separar_argumentos(char *comando, char *argumentos[], size_t capacid
             }
             else if (comilla == '\0' && strchr("|&;<>", actual) != NULL)
             {
-                snprintf(resultado->detalle, sizeof(resultado->detalle),
-                         "No se admiten operadores de shell sin comillas.");
+                establecer_detalle(resultado, "No se admiten operadores de shell sin comillas.");
                 return false;
             }
             else
@@ -1235,7 +1180,7 @@ static bool separar_argumentos(char *comando, char *argumentos[], size_t capacid
 
         if (comilla != '\0')
         {
-            snprintf(resultado->detalle, sizeof(resultado->detalle), "Comillas sin cerrar.");
+            establecer_detalle(resultado, "Comillas sin cerrar.");
             return false;
         }
 
@@ -1248,7 +1193,7 @@ static bool separar_argumentos(char *comando, char *argumentos[], size_t capacid
     argumentos[cantidad] = NULL;
     if (cantidad == 0 || argumentos[0][0] == '\0')
     {
-        snprintf(resultado->detalle, sizeof(resultado->detalle), "Falta el nombre del programa.");
+        establecer_detalle(resultado, "Falta el nombre del programa.");
         return false;
     }
 
@@ -1346,16 +1291,14 @@ static void procesar_programa(const char *contenido, int respuesta, int entrada,
 
     if (fflush(stdout) == EOF)
     {
-        snprintf(resultado->detalle, sizeof(resultado->detalle),
-                 "Error al mostrar la salida antes de ejecutar: %s.", strerror(errno));
+        establecer_detalle(resultado, "Error al mostrar la salida antes de ejecutar: %s.", strerror(errno));
         return;
     }
 
     int errores[2];
     if (pipe(errores) == -1)
     {
-        snprintf(resultado->detalle, sizeof(resultado->detalle),
-                 "Error al crear el pipe de ejecucion: %s.", strerror(errno));
+        establecer_detalle(resultado, "Error al crear el pipe de ejecucion: %s.", strerror(errno));
         return;
     }
 
@@ -1364,8 +1307,7 @@ static void procesar_programa(const char *contenido, int respuesta, int entrada,
     if (fcntl(errores[1], F_SETFD, FD_CLOEXEC) == -1 ||
         clock_gettime(CLOCK_MONOTONIC, &inicio) == -1)
     {
-        snprintf(resultado->detalle, sizeof(resultado->detalle),
-                 "Error al preparar la ejecucion: %s.", strerror(errno));
+        establecer_detalle(resultado, "Error al preparar la ejecucion: %s.", strerror(errno));
         close(errores[0]);
         close(errores[1]);
         return;
@@ -1374,8 +1316,7 @@ static void procesar_programa(const char *contenido, int respuesta, int entrada,
     pid_t pid = fork();
     if (pid == -1)
     {
-        snprintf(resultado->detalle, sizeof(resultado->detalle),
-                 "Error al crear el proceso del programa: %s.", strerror(errno));
+        establecer_detalle(resultado, "Error al crear el proceso del programa: %s.", strerror(errno));
         close(errores[0]);
         close(errores[1]);
         return;
@@ -1395,8 +1336,7 @@ static void procesar_programa(const char *contenido, int respuesta, int entrada,
         int estado;
         (void)terminar_programa(pid, &estado);
         close(errores[0]);
-        snprintf(resultado->detalle, sizeof(resultado->detalle),
-                 "Error al crear el grupo del programa: %s.", strerror(error));
+        establecer_detalle(resultado, "Error al crear el grupo del programa: %s.", strerror(error));
         return;
     }
 
@@ -1406,8 +1346,7 @@ static void procesar_programa(const char *contenido, int respuesta, int entrada,
     {
         int error = errno;
         close(errores[0]);
-        snprintf(resultado->detalle, sizeof(resultado->detalle),
-                 "Error al esperar el programa: %s.", strerror(error));
+        establecer_detalle(resultado, "Error al esperar el programa: %s.", strerror(error));
         return;
     }
 
@@ -1420,8 +1359,7 @@ static void procesar_programa(const char *contenido, int respuesta, int entrada,
     struct timespec fin;
     if (clock_gettime(CLOCK_MONOTONIC, &fin) == -1)
     {
-        snprintf(resultado->detalle, sizeof(resultado->detalle),
-                 "Error al medir el tiempo del programa: %s.", strerror(errno));
+        establecer_detalle(resultado, "Error al medir el tiempo del programa: %s.", strerror(errno));
         return;
     }
 
@@ -1430,25 +1368,20 @@ static void procesar_programa(const char *contenido, int respuesta, int entrada,
     if (aviso.motivo != AVISO_NINGUNO)
         aplicar_cancelacion(resultado, &aviso);
     else if (!comunicado)
-        snprintf(resultado->detalle, sizeof(resultado->detalle),
-                 "Error al recibir el estado de ejecucion: %s.", strerror(error_comunicacion));
+        establecer_detalle(resultado, "Error al recibir el estado de ejecucion: %s.", strerror(error_comunicacion));
     else if (error_ejecucion != 0)
-        snprintf(resultado->detalle, sizeof(resultado->detalle),
-                 "No se pudo lanzar el programa (errno %d): %s.",
-                 error_ejecucion, strerror(error_ejecucion));
+        establecer_detalle(resultado, "No se pudo lanzar el programa (errno %d): %s.",
+                            error_ejecucion, strerror(error_ejecucion));
     else if (WIFSIGNALED(estado))
-        snprintf(resultado->detalle, sizeof(resultado->detalle),
-                 "El programa termino por la senal %d.", WTERMSIG(estado));
+        establecer_detalle(resultado, "El programa termino por la senal %d.", WTERMSIG(estado));
     else if (WIFEXITED(estado))
     {
         int codigo = WEXITSTATUS(estado);
         resultado->estado = codigo == 0 ? RESULTADO_COMPLETADO : RESULTADO_NO_COMPLETADO;
-        snprintf(resultado->detalle, sizeof(resultado->detalle),
-                 "El programa termino con codigo de salida %d.", codigo);
+        establecer_detalle(resultado, "El programa termino con codigo de salida %d.", codigo);
     }
     else
-        snprintf(resultado->detalle, sizeof(resultado->detalle),
-                 "El programa termino con un estado inesperado.");
+        establecer_detalle(resultado, "El programa termino con un estado inesperado.");
 }
 
 /*
@@ -1492,16 +1425,12 @@ static bool iniciar_hijo(const Solicitud *solicitud, unsigned int nivel, unsigne
         close(peticion[1]);
         close(respuesta[0]);
         /* El nieto no debe conservar canales de sus tios ni de sus abuelos. */
-        if (entrada_padre >= 0)
-            close(entrada_padre);
-        if (salida_padre >= 0)
-            close(salida_padre);
+        cerrar_descriptor(&entrada_padre);
+        cerrar_descriptor(&salida_padre);
         for (unsigned int i = 0; i < cantidad_hermanos; i++)
         {
-            if (hermanos[i].envio >= 0)
-                close(hermanos[i].envio);
-            if (hermanos[i].recepcion >= 0)
-                close(hermanos[i].recepcion);
+            cerrar_descriptor(&hermanos[i].envio);
+            cerrar_descriptor(&hermanos[i].recepcion);
         }
         int estado = meeseeks(peticion[0], respuesta[1], nivel, instancia, control);
         if (fflush(stdout) == EOF)
@@ -1517,8 +1446,7 @@ static bool iniciar_hijo(const Solicitud *solicitud, unsigned int nivel, unsigne
     if (!escribir_completo(hijo->envio, solicitud, sizeof(*solicitud)))
     {
         int error = errno;
-        close(hijo->envio);
-        hijo->envio = -1;
+        cerrar_descriptor(&hijo->envio);
         errno = error;
         return false;
     }
@@ -1543,8 +1471,7 @@ static bool avisar_hijos(HijoMeeseeks hijos[], unsigned int cantidad,
             /* Un hijo que ya envio su resultado puede haber cerrado el lector. */
             if (errno != EPIPE)
                 correcto = false;
-            close(hijos[i].envio);
-            hijos[i].envio = -1;
+            cerrar_descriptor(&hijos[i].envio);
         }
         else if (aviso->motivo == AVISO_RESUELTO)
             mensaje_meeseeks(padre, "Aviso por pipe a hijo PID %ld: gano PID %ld; deten tu subarbol.",
@@ -1555,6 +1482,17 @@ static bool avisar_hijos(HijoMeeseeks hijos[], unsigned int cantidad,
                              (aviso->motivo == AVISO_INTERRUPCION ? "interrupcion" : "error"));
     }
     return correcto;
+}
+
+/*
+    Aplica el motivo de cancelación al resultado local y lo comunica a los hijos.
+    Devuelve false si falla el envío por alguno de los canales privados.
+ */
+static bool cancelar_hijos(HijoMeeseeks hijos[], unsigned int cantidad,
+                          const AvisoCancelacion *aviso, Resultado *resultado)
+{
+    aplicar_cancelacion(resultado, aviso);
+    return avisar_hijos(hijos, cantidad, aviso, resultado);
 }
 
 /*
@@ -1570,13 +1508,10 @@ static bool recoger_hijo(HijoMeeseeks *hijo, ControlCompartido *control,
     int error = errno;
     if (recibido)
         *respuesta = mensaje;
-    close(hijo->recepcion);
-    hijo->recepcion = -1;
+    cerrar_descriptor(&hijo->recepcion);
     int estado = 0;
     bool recogido = esperar_proceso(hijo->pid, &estado);
-    if (hijo->envio >= 0)
-        close(hijo->envio);
-    hijo->envio = -1;
+    cerrar_descriptor(&hijo->envio);
     bool liberado = recogido && liberar_meeseeks(control, 1, false);
     mensaje_meeseeks(padre, "Recogi con waitpid al hijo PID %ld.", (long)hijo->pid);
     hijo->pid = 0;
@@ -1601,8 +1536,7 @@ static bool esperar_hijos(int entrada, HijoMeeseeks hijos[], unsigned int cantid
     double mayor_espera = 0.0;
     if (aviso.motivo != AVISO_NINGUNO)
     {
-        aplicar_cancelacion(resultado, &aviso);
-        if (!avisar_hijos(hijos, cantidad, &aviso, resultado))
+        if (!cancelar_hijos(hijos, cantidad, &aviso, resultado))
             correcto = false;
     }
 
@@ -1613,8 +1547,7 @@ static bool esperar_hijos(int entrada, HijoMeeseeks hijos[], unsigned int cantid
         {
             aviso.motivo = restante == 0.0 ? AVISO_PLAZO : AVISO_ERROR;
             correcto = correcto && restante == 0.0;
-            aplicar_cancelacion(resultado, &aviso);
-            if (!avisar_hijos(hijos, cantidad, &aviso, resultado))
+            if (!cancelar_hijos(hijos, cantidad, &aviso, resultado))
                 correcto = false;
         }
 
@@ -1631,8 +1564,7 @@ static bool esperar_hijos(int entrada, HijoMeeseeks hijos[], unsigned int cantid
             /* Aun si falla poll, se ordena el cierre y se recoge cada hijo. */
             correcto = false;
             aviso.motivo = AVISO_ERROR;
-            aplicar_cancelacion(resultado, &aviso);
-            (void)avisar_hijos(hijos, cantidad, &aviso, resultado);
+            (void)cancelar_hijos(hijos, cantidad, &aviso, resultado);
             for (unsigned int i = 0; i < cantidad; i++)
             {
                 if (hijos[i].pid == 0)
@@ -1665,8 +1597,7 @@ static bool esperar_hijos(int entrada, HijoMeeseeks hijos[], unsigned int cantid
             {
                 correcto = false;
                 aviso.motivo = AVISO_ERROR;
-                aplicar_cancelacion(resultado, &aviso);
-                (void)avisar_hijos(hijos, cantidad, &aviso, resultado);
+                (void)cancelar_hijos(hijos, cantidad, &aviso, resultado);
             }
             Resultado respuesta = {0};
             bool recogido = recoger_hijo(&hijos[i], control, &respuesta, resultado);
@@ -1676,15 +1607,13 @@ static bool esperar_hijos(int entrada, HijoMeeseeks hijos[], unsigned int cantid
             {
                 correcto = false;
                 aviso.motivo = AVISO_ERROR;
-                aplicar_cancelacion(resultado, &aviso);
-                (void)avisar_hijos(hijos, cantidad, &aviso, resultado);
+                (void)cancelar_hijos(hijos, cantidad, &aviso, resultado);
             }
             else if (aviso.motivo == AVISO_NINGUNO && respuesta.estado == RESULTADO_COMPLETADO)
             {
                 resultado->estado = RESULTADO_COMPLETADO;
-                resultado->presupuesto_agotado = false;
                 resultado->ganador = respuesta.ganador;
-                snprintf(resultado->detalle, sizeof(resultado->detalle), "%s", respuesta.detalle);
+                establecer_detalle(resultado, "%s", respuesta.detalle);
                 aviso = (AvisoCancelacion){AVISO_RESUELTO, respuesta.ganador};
                 mensaje_meeseeks(resultado, "Hijo informo por pipe: gano PID %ld. Aviso a sus hermanos.",
                                  (long)respuesta.ganador.pid);
@@ -1694,8 +1623,7 @@ static bool esperar_hijos(int entrada, HijoMeeseeks hijos[], unsigned int cantid
             else if (aviso.motivo == AVISO_NINGUNO && respuesta.caos_planetario)
             {
                 aviso.motivo = AVISO_PLAZO;
-                aplicar_cancelacion(resultado, &aviso);
-                if (!avisar_hijos(hijos, cantidad, &aviso, resultado))
+                if (!cancelar_hijos(hijos, cantidad, &aviso, resultado))
                     correcto = false;
             }
         }
@@ -1706,9 +1634,7 @@ static bool esperar_hijos(int entrada, HijoMeeseeks hijos[], unsigned int cantid
     if (aviso.motivo == AVISO_NINGUNO)
     {
         resultado->estado = RESULTADO_NO_COMPLETADO;
-        resultado->presupuesto_agotado = true;
-        snprintf(resultado->detalle, sizeof(resultado->detalle),
-                 "Ningun descendiente resolvio la solicitud dentro del presupuesto.");
+        establecer_detalle(resultado, "Ningun descendiente resolvio la solicitud dentro del presupuesto.");
     }
     return correcto;
 }
@@ -1737,9 +1663,7 @@ static bool solicitar_ayuda(const Solicitud *solicitud, int entrada, int salida,
         else
         {
             resultado->estado = RESULTADO_NO_COMPLETADO;
-            resultado->presupuesto_agotado = true;
-            snprintf(resultado->detalle, sizeof(resultado->detalle),
-                     "Presupuesto insuficiente para crear el grupo de %u hijos.", cantidad);
+            establecer_detalle(resultado, "Presupuesto insuficiente para crear el grupo de %u hijos.", cantidad);
         }
         mensaje_meeseeks(resultado, "%s", resultado->detalle);
         return true;
@@ -1833,16 +1757,17 @@ static int meeseeks(int entrada, int salida, unsigned int nivel, unsigned int in
     {
         mensaje_meeseeks(&resultado, "Error en la solicitud o en sus descendientes; termino la atencion.");
         resultado.estado = RESULTADO_NO_COMPLETADO;
-        snprintf(resultado.detalle, sizeof(resultado.detalle),
-                 "Error interno; los hijos creados fueron recogidos.");
+        establecer_detalle(&resultado, "Error interno; los hijos creados fueron recogidos.");
     }
     close(entrada);
+    if (resultado.estado == RESULTADO_COMPLETADO)
+        mensaje_meeseeks(&resultado, "%s", resultado.detalle);
 
     bool enviado = escribir_completo(salida, &resultado, sizeof(resultado));
     if (!enviado)
         mensaje_meeseeks(&resultado, "Error al enviar resultado: %s.", strerror(errno));
     close(salida);
-    mensaje_meeseeks(&resultado, "Hasta luego. Descendientes recogidos; resultado enviado al padre.");
+    mensaje_meeseeks(&resultado, "Gracias por permitirme ayudar. Hasta luego. Descendientes recogidos; resultado enviado al padre.");
     return correcto && enviado ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
@@ -1970,10 +1895,8 @@ static bool crear_meeseeks(const Solicitud *solicitud, Resultado *resultado,
         if (restante < 0.0)
             return false;
         resultado->caos_planetario = restante == 0.0;
-        resultado->presupuesto_agotado = restante > 0.0;
-        snprintf(resultado->detalle, sizeof(resultado->detalle),
-                 restante == 0.0 ? "Caos planetario: plazo agotado antes de fork." :
-                 "Presupuesto de procesos agotado.");
+        establecer_detalle(resultado, restante == 0.0 ? "Caos planetario: plazo agotado antes de fork." :
+                            "Presupuesto de procesos agotado.");
         return true;
     }
 
@@ -1993,9 +1916,7 @@ static bool crear_meeseeks(const Solicitud *solicitud, Resultado *resultado,
     {
         perror("Error al enviar la solicitud");
         /* EOF tambien cancela un subarbol si se pierde su padre. */
-        if (hijo.envio >= 0)
-            close(hijo.envio);
-        hijo.envio = -1;
+        cerrar_descriptor(&hijo.envio);
     }
 
     Resultado respuesta = {0};
@@ -2003,15 +1924,12 @@ static bool crear_meeseeks(const Solicitud *solicitud, Resultado *resultado,
     if (!recibido)
     {
         perror("Error al recibir el resultado");
-        if (hijo.envio >= 0)
-            close(hijo.envio);
-        hijo.envio = -1;
+        cerrar_descriptor(&hijo.envio);
     }
     close(hijo.recepcion);
     bool recogido = false;
     bool terminado = esperar_meeseeks(hijo.pid, &recogido);
-    if (hijo.envio >= 0)
-        close(hijo.envio);
+    cerrar_descriptor(&hijo.envio);
     bool liberado = recogido && liberar_meeseeks(control, 1, false);
     if (recibido)
         *resultado = respuesta;
@@ -2025,13 +1943,11 @@ static bool crear_meeseeks(const Solicitud *solicitud, Resultado *resultado,
  */
 static bool procesar_solicitud(RegistroSolicitud *registro, const Configuracion *configuracion)
 {
-    registro->configuracion = *configuracion;
     struct timespec inicio;
     if (clock_gettime(CLOCK_MONOTONIC, &inicio) == -1)
     {
         perror("Error al iniciar la medicion de la solicitud");
-        snprintf(registro->resultado.detalle, sizeof(registro->resultado.detalle),
-                 "No se pudo iniciar la medicion de la solicitud.");
+        establecer_detalle(&registro->resultado, "No se pudo iniciar la medicion de la solicitud.");
         return false;
     }
 
@@ -2065,9 +1981,7 @@ static bool procesar_solicitud(RegistroSolicitud *registro, const Configuracion 
     /* El hijo ya fue recogido: solo la Box destruye los recursos compartidos. */
     registro->resultado.meeseeks_creados = control->creados;
     registro->resultado.profundidad_maxima = control->profundidad_maxima;
-    registro->resultado.meeseeks_recogidos = control->recogidos;
-    registro->resultado.activos_al_final = control->activos;
-    if (control->activos != 0 || control->recogidos != control->creados)
+    if (control->activos != 0)
     {
         fputs("Box: contador de procesos activos inconsistente.\n", stderr);
         procesada = false;
@@ -2095,30 +2009,14 @@ static bool procesar_solicitud(RegistroSolicitud *registro, const Configuracion 
 }
 
 /*
-    Muestra los límites y semillas usados en una solicitud, junto con el modo
-    de ejecución y la indicación de si su duración superó el plazo normal.
- */
-static void mostrar_configuracion_registro(const RegistroSolicitud *registro)
-{
-    const Configuracion *configuracion = &registro->configuracion;
-    printf("Modo: %s. Plazo normal: %.3f s. Limite efectivo: %.3f s. Presupuesto: %u.\n",
-           configuracion->modo_experimental ? "experimental" : "normal",
-           configuracion->plazo_segundos, plazo_efectivo(configuracion), configuracion->max_procesos);
-    printf("Semilla base: %u. Semilla solicitud: %u. Supero duracion normal: %s.\n",
-           (unsigned int)configuracion->semilla, (unsigned int)registro->solicitud.semilla,
-           registro->tiempo_transcurrido_segundos > configuracion->plazo_segundos ? "si" : "no");
-}
-
-/*
-    Presenta el estado y detalle de la solicitud, la identidad del Meeseeks inicial
-    y del ganador cuando existe, además de los contadores y la profundidad alcanzada.
+    Muestra la identidad inicial, el ganador cuando existe, el estado,
+    la cantidad de Meeseeks creados, la profundidad y el detalle de la solicitud.
  */
 static void mostrar_resultado(const Resultado *resultado)
 {
     if (resultado->pid > 0)
         printf("Box: Meeseeks asociado (PID %ld, PPID %ld, N %u, i %u).\n",
-               (long)resultado->pid, (long)resultado->ppid,
-               resultado->nivel, resultado->instancia);
+               (long)resultado->pid, (long)resultado->ppid, resultado->nivel, resultado->instancia);
     else
         puts("Box: no se creo un Meeseeks para esta solicitud.");
 
@@ -2126,11 +2024,10 @@ static void mostrar_resultado(const Resultado *resultado)
         printf("Box: ganador (PID %ld, PPID %ld, N %u, i %u).\n",
                (long)resultado->ganador.pid, (long)resultado->ganador.ppid,
                resultado->ganador.nivel, resultado->ganador.instancia);
-    printf("Box: solicitud %s.\n", nombre_estado(resultado->estado));
-    printf("Box: Meeseeks creados: %u. Recogidos: %u. Activos al cerrar: %u. Profundidad maxima: %u.\n",
-           resultado->meeseeks_creados, resultado->meeseeks_recogidos,
-           resultado->activos_al_final, resultado->profundidad_maxima);
 
+    printf("Box: solicitud %s.\n", nombre_estado(resultado->estado));
+    printf("Box: Meeseeks creados: %u. Profundidad maxima: %u.\n",
+           resultado->meeseeks_creados, resultado->profundidad_maxima);
     if (resultado->detalle[0] != '\0')
         printf("Box: %s\n", resultado->detalle);
 }
@@ -2161,70 +2058,28 @@ static void mostrar_tiempos(const RegistroSolicitud *registro)
 }
 
 /*
-    Resume el historial al salir de la Box: cuenta solicitudes por estado y motivo
-    de finalización, y presenta por solicitud su configuración, procesos, ganador
-    y tiempos medidos durante la ejecución.
+    Resume las solicitudes completadas y no completadas, y muestra por cada
+    solicitud su resultado, ganador, cantidad de procesos y tiempos medidos.
  */
 static void mostrar_informe(const RegistroSolicitud historial[], size_t cantidad)
 {
     size_t completadas = 0;
-    size_t no_completadas = 0;
-    size_t pendientes = 0;
-    size_t caos = 0;
-    size_t recursos = 0;
-    size_t interrumpidas = 0;
-    size_t extendidas = 0;
-
     for (size_t i = 0; i < cantidad; i++)
     {
-        caos += historial[i].resultado.caos_planetario;
-        recursos += historial[i].resultado.presupuesto_agotado;
-        interrumpidas += historial[i].resultado.interrumpida;
-        extendidas += historial[i].configuracion.modo_experimental &&
-                      historial[i].tiempo_transcurrido_segundos > historial[i].configuracion.plazo_segundos;
-        switch (historial[i].resultado.estado)
-        {
-            case RESULTADO_COMPLETADO:
-                completadas++;
-                break;
-            case RESULTADO_NO_COMPLETADO:
-                no_completadas++;
-                break;
-            default:
-                pendientes++;
-                break;
-        }
+        if (historial[i].resultado.estado == RESULTADO_COMPLETADO)
+            completadas++;
     }
 
     puts("\n=== INFORME DE SOLICITUDES ===");
     printf("Total de solicitudes recibidas: %zu\n", cantidad);
-    printf("Completadas: %zu\nNo completadas: %zu\nPendientes: %zu\n",
-           completadas, no_completadas, pendientes);
-    printf("Caos planetario: %zu. Fin por presupuesto: %zu. Interrumpidas: %zu.\n", caos, recursos, interrumpidas);
-    printf("Experimentales que superaron duracion normal: %zu.\n", extendidas);
+    printf("Completadas: %zu\nNo completadas: %zu\n", completadas, cantidad - completadas);
 
     for (size_t i = 0; i < cantidad; i++)
     {
         const RegistroSolicitud *registro = &historial[i];
         printf("\nSolicitud #%zu (%s): \"%s\"\n", i + 1,
                nombre_tipo(registro->solicitud.tipo), registro->solicitud.contenido);
-        mostrar_configuracion_registro(registro);
-        printf("Estado: %s. Meeseeks creados: %u. Recogidos: %u. Activos al cerrar: %u.\n",
-               nombre_estado(registro->resultado.estado), registro->resultado.meeseeks_creados,
-               registro->resultado.meeseeks_recogidos, registro->resultado.activos_al_final);
-        printf("Profundidad maxima: %u. Caos planetario: %s.\n",
-               registro->resultado.profundidad_maxima,
-               registro->resultado.caos_planetario ? "si" : "no");
-        if (registro->resultado.pid > 0)
-            printf("Meeseeks inicial: (PID %ld, PPID %ld, N %u, i %u).\n",
-                   (long)registro->resultado.pid, (long)registro->resultado.ppid,
-                   registro->resultado.nivel, registro->resultado.instancia);
-        if (registro->resultado.estado == RESULTADO_COMPLETADO)
-            printf("Ganador: (PID %ld, PPID %ld, N %u, i %u).\n",
-                   (long)registro->resultado.ganador.pid, (long)registro->resultado.ganador.ppid,
-                   registro->resultado.ganador.nivel, registro->resultado.ganador.instancia);
-        if (registro->resultado.detalle[0] != '\0')
-            printf("Detalle: %s\n", registro->resultado.detalle);
+        mostrar_resultado(&registro->resultado);
         mostrar_tiempos(registro);
     }
 }
@@ -2258,11 +2113,11 @@ static int box(void)
     }
 
     uint32_t semilla_captura = configuracion.semilla;
-    printf("Box: modo %s; limite efectivo %.3f segundos; semilla base %u.\n",
+    printf("Box: modo %s; limite efectivo %.3f segundos.\n",
            configuracion.modo_experimental ? "experimental" : "normal",
-           plazo_efectivo(&configuracion), (unsigned int)configuracion.semilla);
+           plazo_efectivo(&configuracion));
 
-    while(1)
+    while (1)
     {
         puts("\n--- MENU PRINCIPAL ---");
         puts("1. Solicitud textual (simulacion)");
@@ -2273,14 +2128,7 @@ static int box(void)
         int opcion = leer_opcion(); 
 
         if (opcion == -2)
-        {
-            if (ferror(stdin))
-            {
-                perror("Error al leer la opcion");
-                resultado = EXIT_FAILURE;
-            }
             break;
-        }
 
         if (opcion < 0 || opcion > 3)
         {
@@ -2293,14 +2141,7 @@ static int box(void)
         if (!leer_solicitud(&texto, &capacidad))
         {
             if (feof(stdin) || ferror(stdin))
-            {
-                if (ferror(stdin))
-                {
-                    perror("Error al leer la solicitud");
-                    resultado = EXIT_FAILURE;
-                }
                 break;
-            }
 
             puts("Solicitud invalida: no puede estar vacia ni superar 255 caracteres.");
             continue;
@@ -2313,14 +2154,7 @@ static int box(void)
         if (solicitud.tipo == TIPO_TEXTO &&
             !capturar_datos_textuales(&solicitud, &semilla_captura))
         {
-            if (ferror(stdin))
-            {
-                perror("Error al configurar la solicitud");
-                resultado = EXIT_FAILURE;
-                break;
-            }
-
-            if (feof(stdin))
+            if (feof(stdin) || ferror(stdin))
                 break;
 
             puts("Box: solicitud cancelada.");
@@ -2342,13 +2176,18 @@ static int box(void)
         mostrar_resultado(&registro->resultado);
         mostrar_tiempos(registro);
 
-        if (!procesada)
+        if (!procesada || registro->resultado.caos_planetario)
         {
             resultado = EXIT_FAILURE;
             break;
         }
     }
 
+    if (ferror(stdin))
+    {
+        perror("Error al leer la entrada");
+        resultado = EXIT_FAILURE;
+    }
     mostrar_informe(historial, total_solicitudes);
     puts("Box: ¡Hasta luego!");
     free(texto);

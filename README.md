@@ -48,7 +48,7 @@ interfaces de procesos y memoria compartida.
 9. Árbol recursivo con grupos completos de hijos y tabulaciones por nivel.
 10. Resolución y cancelación en cascada por pipes, ganador y recolección del árbol.
 11. Modo experimental con límite extraordinario, cancelación por señales e informe completo.
-12. Semillas configurables para repetir los sorteos.
+12. Reutilización de captura, mensajes, cierres de canales e impresión de resultados.
 
 ## Organización del código
 
@@ -62,11 +62,11 @@ contadores y el inicio del plazo. Las solicitudes siguen viajando por pipes.
 
 | Parte | Funciones principales |
 | --- | --- |
-| Control y lectura | `main()`, `box()`, `limpiar_espacios()`, `leer_solicitud()`, `leer_numero()`, `leer_opcion()`. |
+| Control y lectura | `main()`, `box()`, `limpiar_espacios()`, `leer_solicitud()`, `leer_numero()`, `leer_opcion()`, `leer_modalidad()` y `leer_numero_en_rango()`. |
 | Configuración | `capturar_datos_textuales()` pide facilidad y duración: 1 manual, 2 aleatorio. `cargar_configuracion()` lee los límites. |
-| Presentación | `nombre_tipo()`, `nombre_estado()`, `mostrar_solicitud()`, `mostrar_resultado()`. |
-| Procesos y pipes | `crear_meeseeks()`, `iniciar_hijo()`, `meeseeks()`, `leer_completo()`, `escribir_completo()`, `esperar_proceso()`, `esperar_meeseeks()`. Las transferencias completan datos parciales y reintentan ante `EINTR`. |
-| Árbol y cascada | `solicitar_ayuda()`, `esperar_hijos()`, `avisar_hijos()`, `recibir_aviso()`, `aplicar_cancelacion()` y `recoger_hijo()` coordinan los hijos directos y propagan los mensajes. |
+| Presentación | `nombre_tipo()`, `nombre_estado()`, `mostrar_solicitud()`, `mostrar_resultado()` y `establecer_detalle()`. |
+| Procesos y pipes | `crear_meeseeks()`, `iniciar_hijo()`, `meeseeks()`, `leer_completo()`, `escribir_completo()`, `esperar_proceso()`, `esperar_meeseeks()`. Las transferencias completan datos parciales y reintentan ante `EINTR`; `cerrar_descriptor()` cierra e invalida un canal. |
+| Árbol y cascada | `solicitar_ayuda()`, `esperar_hijos()`, `avisar_hijos()`, `recibir_aviso()`, `aplicar_cancelacion()`, `recoger_hijo()` y `cancelar_hijos()` coordinan los hijos directos y propagan los mensajes. |
 | Secuencia | `imprimir_linea()` y `mensaje_meeseeks()` muestran mensajes con PID, PPID y una tabulación por nivel adicional. |
 | Cálculos | `procesar_calculo()` valida la expresión y usa TinyExpr. |
 | Programas | `separar_argumentos()`, `procesar_programa()`, `ejecutar_programa_hijo()`, `leer_error_ejecucion()`, `esperar_programa_limitado()`, `terminar_programa()`. |
@@ -74,6 +74,11 @@ contadores y el inicio del plazo. Las solicitudes siguen viajando por pipes.
 | Sincronización | `crear_control()`, `bloquear_control()`, `reservar_meeseeks()`, `liberar_meeseeks()`, `tiempo_disponible()`. |
 | Tiempos e historial | `procesar_solicitud()`, `diferencia_segundos()`, `tiempo_sin_simulacion()`, `mostrar_tiempos()`, `registrar_solicitud()`, `mostrar_informe()`. |
 | Contingencia | `plazo_efectivo()`, `consultar_interrupcion()` y `recibir_resultado_raiz()` supervisan el plazo y la cancelación. |
+
+La captura trata Ctrl+D como fin de entrada y muestra el informe antes de salir.
+Los errores de lectura se notifican en un solo punto de `box()`. Se mantienen los
+controles necesarios para validar entradas, comunicar mensajes completos, limitar
+los procesos y recoger a los hijos.
 
 ## Bibliotecas y solicitudes
 
@@ -118,13 +123,10 @@ P=6.25%; con F=45, P=20.25%; con F=85, P=72.25%. Para F>85 el único Meeseeks
 resuelve siempre, siempre que termine la simulación antes del plazo. F=0 nunca
 se resuelve, ni por aging ni por un sorteo favorable.
 
-Después de esperar, el Meeseeks compara un sorteo uniforme en [0,1) con P. Usa
-Xorshift32 con estado local: `MEESEEKS_SEMILLA` fija la semilla base y
-`derivar_semilla()` obtiene una semilla por solicitud y por ruta de hijos. Sin
-esa variable, la Box genera la semilla con reloj y PID y la informa. Así no se
-heredan secuencias idénticas tras `fork()` y se pueden repetir los sorteos sin
-depender de la implementación de `rand_r()`. No es un generador criptográfico;
-la planificación todavía puede cambiar las ramas creadas y el ganador.
+Después de esperar, el Meeseeks compara un sorteo uniforme en [0,1) con P.
+Xorshift32 usa un estado local: la Box inicializa la semilla con reloj y PID,
+y cada solicitud e hijo reciben una semilla derivada. Así los procesos creados
+con `fork()` no repiten simplemente la misma secuencia heredada.
 
 Si falla, la ayuda se calcula con F original: 5 hijos para F<=45 y 2 para
 45<F<=85. Cada hijo recibe la misma solicitud por su pipe privado, con nivel
@@ -179,15 +181,13 @@ Los límites se configuran mediante variables de entorno:
 | `MEESEEKS_PLAZO_SEGUNDOS` | 300 segundos (5 minutos) | Positivo, hasta 86400. |
 | `MEESEEKS_EXPERIMENTAL` | 0 | 0 normal, 1 experimental. |
 | `MEESEEKS_LIMITE_EXTRAORDINARIO` | Sin definir | Obligatorio solo en modo experimental, mayor que el plazo normal y hasta 86400 s. |
-| `MEESEEKS_SEMILLA` | Generada e informada | Entero de 0 a 4294967295. |
 
 El plazo comienza antes de preparar los recursos y crear al primer Meeseeks;
 incluye la espera simulada. En modo normal se aplica el plazo normal. El modo
 experimental continúa después de ese plazo y aplica el límite extraordinario
-explícito; mantiene el mismo presupuesto de procesos. La Box anuncia el cruce
-del plazo normal y registra si la duración total lo superó. `poll()` espera
+explícito; mantiene el mismo presupuesto de procesos. La Box anuncia cuando se supera el plazo normal. `poll()` espera
 como máximo el tiempo restante y puede despertar antes por un mensaje. Al agotarse el plazo, el árbol se cancela
-y recoge, y se informa caos planetario. La planificación, la salida en terminal
+y recoge, se informa caos planetario y la Box termina mostrando el informe. La planificación, la salida en terminal
 y la recolección pueden hacer que el tiempo observado supere el plazo; no es
 una garantía de tiempo real estricto. Si antes se agota el presupuesto sin
 solución, termina como no completada por recursos, sin esperar al caos.
@@ -224,9 +224,9 @@ de pared ajustada por una rama; no es tiempo de CPU ni una suma del trabajo de
 todos los procesos. El programa externo conserva su propia duración, incluido
 el lanzamiento y la recolección. Su sondeo puede agregar un intervalo de revisión
 y demoras del planificador. Un tiempo en -1 significa que no está disponible.
-El informe incluye estados, tiempos, presupuesto, modo, semillas, profundidad,
-ganador, creados, recogidos y activos al cerrar. Resume caos, fin por presupuesto,
-interrupciones y experimentales que superaron la duración normal. El cierre
-normal exige creados = recogidos y activos = 0. El informe se muestra en la
-terminal al salir del programa. Las corridas y el análisis de resultados se
+El informe incluye el total de solicitudes, completadas y no completadas. Para
+cada solicitud muestra contenido, tipo, estado, duración, cantidad de Meeseeks,
+profundidad y ganador cuando existe. Los errores y el caos quedan en el detalle.
+El contador interno de activos debe quedar en cero después de recoger el árbol.
+El informe se muestra en la terminal al salir; las corridas y el análisis se
 documentan por separado mediante capturas.

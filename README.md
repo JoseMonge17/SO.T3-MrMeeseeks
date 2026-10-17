@@ -103,19 +103,23 @@ ni variables y se evalúan sin cortocircuito: `0 && (1/0)` también produce un e
 
 ## Límites y caos planetario
 
-El plazo predeterminado es de 300 segundos, equivalente a cinco minutos, y el
-presupuesto es de 128 Meeseeks por solicitud.
+La Box solicita la configuración una sola vez al iniciar, antes del menú principal.
+El plazo normal predeterminado es de 300 segundos (cinco minutos): Enter conserva
+ese valor. Se admiten otros tiempos positivos, incluso menores para pruebas rápidas,
+hasta 86400 segundos. Las entradas inválidas se solicitan nuevamente.
 
-`MEESEEKS_PLAZO_SEGUNDOS` permite configurar el plazo y `MEESEEKS_MAX_PROCESOS`
-el presupuesto, hasta un máximo de 256. Al alcanzar el plazo se declara caos
-planetario, se cancela y recoge el árbol y la Box termina mostrando el informe.
+El modo experimental está desactivado por defecto. Se activa respondiendo `s` y
+permite continuar después del plazo normal hasta un límite extraordinario mayor.
+Enter propone 900 segundos para ese límite; si no supera el normal, debe ingresarse
+otro valor. Por ejemplo, un plazo normal de 2 segundos y uno extraordinario de 6
+permiten ejecutar `sleep 4` sin cancelarlo al llegar a los 2 segundos.
 
-Para las pruebas que exceden el plazo normal existe un modo experimental con
-un límite extraordinario explícito y el presupuesto de procesos activo:
-
-```bash
-MEESEEKS_EXPERIMENTAL=1 MEESEEKS_LIMITE_EXTRAORDINARIO=900 MEESEEKS_MAX_PROCESOS=64 ./build/meeseeks
-```
+La configuración se conserva para todas las solicitudes. Al alcanzar el plazo
+efectivo se declara caos planetario, se cancela y recoge el árbol y la Box termina
+mostrando el informe. El presupuesto permanece fijo en 128 Meeseeks por solicitud;
+puede modificarse mediante `MAX_PROCESOS` en `src/main.c` y recompilando. La semilla
+aleatoria se inicializa automáticamente a partir de `time(NULL)` y se deriva para
+cada hijo para evitar secuencias idénticas.
 
 ## Informe y entrega
 

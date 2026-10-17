@@ -41,9 +41,9 @@
 
 #define MAX_TEXTO 256
 #define MAX_ARGUMENTOS 32
-#define MAX_PROCESOS 256
-#define PROCESOS_PREDETERMINADOS 128
+#define MAX_PROCESOS 128
 #define PLAZO_PREDETERMINADO 300.0
+#define LIMITE_EXTRAORDINARIO_PREDETERMINADO 900.0
 #define PLAZO_MAXIMO 86400.0
 #define INTERVALO_REVISION 0.01
 #define MAX_HIJOS 5
@@ -274,72 +274,6 @@ static double plazo_efectivo(const Configuracion *configuracion)
 {
     return configuracion->modo_experimental ? configuracion->limite_extraordinario :
                                              configuracion->plazo_segundos;
-}
-
-/* Lee una configuración numérica; si no existe conserva el valor predeterminado. */
-static bool leer_variable_positiva(const char *nombre, double maximo, double *valor)
-{
-    const char *texto = getenv(nombre);
-    if (texto == NULL)
-        return true;
-    char *fin;
-    errno = 0;
-    double numero = strtod(texto, &fin);
-    if (fin == texto || *fin != '\0' || errno == ERANGE || !isfinite(numero) ||
-        numero <= 0.0 || numero > maximo)
-    {
-        fprintf(stderr, "Configuracion invalida en %s.\n", nombre);
-        return false;
-    }
-    *valor = numero;
-    return true;
-}
-
-/* Valida el presupuesto y los plazos e inicializa la semilla aleatoria. */
-static bool cargar_configuracion(Configuracion *configuracion)
-{
-    *configuracion = (Configuracion){.max_procesos = PROCESOS_PREDETERMINADOS,
-                                    .plazo_segundos = PLAZO_PREDETERMINADO};
-    double procesos = configuracion->max_procesos;
-    if (!leer_variable_positiva("MEESEEKS_MAX_PROCESOS", MAX_PROCESOS, &procesos) ||
-        !leer_variable_positiva("MEESEEKS_PLAZO_SEGUNDOS", PLAZO_MAXIMO, &configuracion->plazo_segundos))
-        return false;
-    if (floor(procesos) != procesos)
-    {
-        fputs("MEESEEKS_MAX_PROCESOS debe ser entero.\n", stderr);
-        return false;
-    }
-    configuracion->max_procesos = (unsigned int)procesos;
-
-    const char *modo = getenv("MEESEEKS_EXPERIMENTAL");
-    if (modo != NULL && strcmp(modo, "0") != 0 && strcmp(modo, "1") != 0)
-    {
-        fputs("MEESEEKS_EXPERIMENTAL debe ser 0 o 1.\n", stderr);
-        return false;
-    }
-    configuracion->modo_experimental = modo != NULL && strcmp(modo, "1") == 0;
-    const char *extra = getenv("MEESEEKS_LIMITE_EXTRAORDINARIO");
-    if ((configuracion->modo_experimental && extra == NULL) ||
-        (!configuracion->modo_experimental && extra != NULL))
-    {
-        fputs("El modo experimental requiere un limite extraordinario explicito y viceversa.\n", stderr);
-        return false;
-    }
-    if (!leer_variable_positiva("MEESEEKS_LIMITE_EXTRAORDINARIO", PLAZO_MAXIMO,
-                                &configuracion->limite_extraordinario))
-        return false;
-    if (configuracion->modo_experimental && configuracion->limite_extraordinario <= configuracion->plazo_segundos)
-    {
-        fputs("El limite extraordinario debe superar el plazo normal.\n", stderr);
-        return false;
-    }
-
-    double semilla = (double)time(NULL);
-    if (!leer_variable_positiva("MEESEEKS_SEMILLA", UINT_MAX, &semilla) ||
-        semilla <= 0.0 || floor(semilla) != semilla)
-        return false;
-    configuracion->semilla = (unsigned int)semilla;
-    return true;
 }
 
 /* Adquiere el semáforo compartido, reintentando si una señal interrumpe la espera. */
@@ -724,6 +658,71 @@ static bool leer_numero_en_rango(const char *mensaje, const char *error, double 
         puts(error);
     }
     return false;
+}
+
+/* Lee un plazo mayor que el mínimo; Enter utiliza el valor predeterminado. */
+static bool leer_plazo(const char *mensaje, double predeterminado, double minimo, double *plazo)
+{
+    char *entrada = NULL;
+    size_t capacidad = 0;
+
+    while (1)
+    {
+        printf("%s (Enter: %.0f): ", mensaje, predeterminado);
+        fflush(stdout);
+        if (getline(&entrada, &capacidad, stdin) == -1)
+            break;
+
+        limpiar_espacios(entrada);
+        char *fin = entrada;
+        errno = 0;
+        double valor = *entrada == '\0' ? predeterminado : strtod(entrada, &fin);
+        if ((*entrada == '\0' || (fin != entrada && *fin == '\0')) &&
+            errno != ERANGE && isfinite(valor) && valor > minimo && valor <= PLAZO_MAXIMO)
+        {
+            *plazo = valor;
+            free(entrada);
+            return true;
+        }
+        printf("Ingrese un tiempo mayor que %.3f y hasta %.0f segundos.\n", minimo, PLAZO_MAXIMO);
+    }
+    free(entrada);
+    return false;
+}
+
+/* Solicita una sola configuración para todas las solicitudes e inicializa la semilla. */
+static bool configurar_box(Configuracion *configuracion)
+{
+    *configuracion = (Configuracion){.max_procesos = MAX_PROCESOS,
+                                    .semilla = (unsigned int)time(NULL)};
+    puts("\n--- CONFIGURACION INICIAL ---");
+    if (!leer_plazo("Tiempo maximo para caos planetario en segundos", PLAZO_PREDETERMINADO,
+                    0.0, &configuracion->plazo_segundos))
+        return false;
+
+    char *entrada = NULL;
+    size_t capacidad = 0;
+    while (1)
+    {
+        printf("Activar modo experimental? (s/n, Enter: n): ");
+        fflush(stdout);
+        if (getline(&entrada, &capacidad, stdin) == -1)
+        {
+            free(entrada);
+            return false;
+        }
+        limpiar_espacios(entrada);
+        configuracion->modo_experimental = strcmp(entrada, "s") == 0 || strcmp(entrada, "S") == 0;
+        if (configuracion->modo_experimental || *entrada == '\0' ||
+            strcmp(entrada, "n") == 0 || strcmp(entrada, "N") == 0)
+            break;
+        puts("Ingrese s o n.");
+    }
+    free(entrada);
+    return !configuracion->modo_experimental ||
+           leer_plazo("Limite extraordinario en segundos (mayor que el normal)",
+                      LIMITE_EXTRAORDINARIO_PREDETERMINADO, configuracion->plazo_segundos,
+                      &configuracion->limite_extraordinario);
 }
 
 /* Configura facilidad y duración; false indica cancelación, fin de entrada o error. */
@@ -1911,7 +1910,7 @@ static int box(void)
     size_t total_solicitudes = 0;
     int resultado = EXIT_SUCCESS;
     Configuracion configuracion;
-    if (!cargar_configuracion(&configuracion))
+    if (!configurar_box(&configuracion))
         return EXIT_FAILURE;
     printf("Box: limites por solicitud: %u Meeseeks, %.3f segundos.\n",
            configuracion.max_procesos, configuracion.plazo_segundos);

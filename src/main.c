@@ -735,14 +735,16 @@ static bool capturar_datos_textuales(Solicitud *solicitud)
     puts("0. Cancelar solicitud");
 
     int opcion = leer_modalidad();
+    
     if (opcion <= 0)
         return false;
+        
     solicitud->facilidad_aleatoria = opcion == 2;
+
     if (solicitud->facilidad_aleatoria)
         solicitud->facilidad = 100.0 * aleatorio_uniforme();
-    else if (!leer_numero_en_rango("Facilidad (0 a 100): ",
-                                  "La facilidad debe estar entre 0 y 100.",
-                                  100.0, true, &solicitud->facilidad))
+
+    else if (!leer_numero_en_rango("Facilidad (0 a 100): ", "La facilidad debe estar entre 0 y 100.", 100.0, true, &solicitud->facilidad))
         return false;
 
     puts("\nDuracion de la simulacion:");
@@ -753,12 +755,11 @@ static bool capturar_datos_textuales(Solicitud *solicitud)
     opcion = leer_modalidad();
     if (opcion <= 0)
         return false;
+
     solicitud->tiempo_aleatorio = opcion == 2;
     solicitud->tiempo_segundos = 0.0;
-    return solicitud->tiempo_aleatorio ||
-           leer_numero_en_rango("Duracion en segundos (> 0): ",
-                                "La duracion debe ser mayor que cero.",
-                                INFINITY, false, &solicitud->tiempo_segundos);
+
+    return solicitud->tiempo_aleatorio ||  leer_numero_en_rango("Duracion en segundos (> 0): ", "La duracion debe ser mayor que cero.", INFINITY, false, &solicitud->tiempo_segundos);
 }
 
 
@@ -1251,16 +1252,16 @@ static void procesar_programa(const char *contenido, int respuesta, int entrada,
     Crea dos pipes privados y el hijo con fork, y le envía la Solicitud.
     El hijo cierra los canales heredados ajenos. El presupuesto ya debe estar reservado.
  */
-static bool iniciar_hijo(const Solicitud *solicitud, unsigned int nivel, unsigned int instancia,
-                         int entrada_padre, int salida_padre, HijoMeeseeks hermanos[],
-                         unsigned int cantidad_hermanos, HijoMeeseeks *hijo,
-                         ControlCompartido *control)
+static bool iniciar_hijo(const Solicitud *solicitud, unsigned int nivel, unsigned int instancia, int entrada_padre, int salida_padre, HijoMeeseeks  hermanos[],unsigned int cantidad_hermanos, HijoMeeseeks *hijo, ControlCompartido *control)
 {
     int peticion[2];
     int respuesta[2];
+
     *hijo = (HijoMeeseeks){.envio = -1, .recepcion = -1};
+
     if (pipe(peticion) == -1)
         return false;
+
     if (pipe(respuesta) == -1)
     {
         int error = errno;
@@ -1909,15 +1910,17 @@ static int box(void)
     RegistroSolicitud *historial = NULL;
     size_t total_solicitudes = 0;
     int resultado = EXIT_SUCCESS;
+
     Configuracion configuracion;
     if (!configurar_box(&configuracion))
         return EXIT_FAILURE;
-    printf("Box: limites por solicitud: %u Meeseeks, %.3f segundos.\n",
-           configuracion.max_procesos, configuracion.plazo_segundos);
+
+    printf("Box: limites por solicitud: %u Meeseeks, %.3f segundos.\n", configuracion.max_procesos, configuracion.plazo_segundos);
 
     /* Un pipe sin lector debe producir EPIPE, sin terminar abruptamente la Box. */
     struct sigaction accion = {0};
     accion.sa_handler = SIG_IGN;
+
     sigemptyset(&accion.sa_mask);
     if (sigaction(SIGPIPE, &accion, NULL) == -1)
     {
